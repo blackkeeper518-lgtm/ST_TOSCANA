@@ -3,30 +3,11 @@ import { adminProcedure, publicProcedure, router } from "./_core/trpc";
 import { COOKIE_NAME } from "../shared/const";
 import { sendMetaMessage } from "./meta";
 import { storagePut } from "./storage";
-import { fetchChatMessagesFromServer, fetchChatThreadsFromServer, fetchParcelMappingQueue, purgeOldParcels, recordOutgoingChatMessage, supabaseGet, supabasePost } from "./supabase";
+import { fetchParcelMappingQueue, purgeOldParcels, supabaseGet, supabasePost } from "./supabase";
 import * as db from "./db";
 
 const ownerId = (ctx: { user: { id: number } | null }) => ctx.user?.id ?? 0;
 const kind = z.enum(["code", "sql", "workflow", "document", "config", "other"]);
-async function persistOutgoingChatBestEffort(input: Parameters<typeof recordOutgoingChatMessage>[0]) {
-  try {
-    await recordOutgoingChatMessage(input);
-  } catch (error) {
-    // Meta already accepted the message; a secondary audit failure must not
-    // falsely report that the customer reply failed.
-    console.error("[chat] outgoing write-back failed after Meta accepted message", error);
-  }
-}
-async function persistLocalChatBestEffort(input: Parameters<typeof db.saveChatMessage>[0]) {
-  try {
-    await db.saveChatMessage(input);
-  } catch (error) {
-    // The canonical chat tables are the source of truth. Local MySQL is only
-    // an optional audit cache and must never turn a successful Meta send into
-    // a failed reply in the operator UI.
-    console.error("[chat] local audit write skipped after Meta accepted message", error);
-  }
-}
 
 export const appRouter = router({
   health: publicProcedure.query(() => ({ ok: true, service: "drakside-system", time: new Date().toISOString() })),
@@ -37,12 +18,9 @@ export const appRouter = router({
   }),
 
   chat: router({
-    threads: publicProcedure.query(() => fetchChatThreadsFromServer()),
-    messages: publicProcedure.input(z.object({ pageId: z.string().min(1), threadId: z.string().min(1) })).query(({ input }) => fetchChatMessagesFromServer(input.pageId, input.threadId)),
-    sendReply: publicProcedure.input(z.object({ pageId: z.string(), pageName: z.string().optional(), portalKey: z.string().optional(), chatLinkKey: z.string().optional(), threadId: z.string(), recipientId: z.string(), text: z.string().optional(), imageUrl: z.string().optional(), stickerId: z.string().optional() })).mutation(async ({ input, ctx }) => {
+    sendReply: publicProcedure.input(z.object({ pageId: z.string(), threadId: z.string(), recipientId: z.string(), text: z.string().optional(), imageUrl: z.string().optional(), stickerId: z.string().optional() })).mutation(async ({ input, ctx }) => {
       const result = await sendMetaMessage(input);
-      void persistOutgoingChatBestEffort({ portalKey: input.portalKey, chatLinkKey: input.chatLinkKey, pageId: input.pageId, pageName: input.pageName, threadId: input.threadId, recipientId: input.recipientId, messageId: result.message_id, text: input.text });
-      void persistLocalChatBestEffort({ pageId: input.pageId, threadId: input.threadId, senderId: input.pageId, senderType: "page", direction: "outbound", text: input.text, attachments: input.imageUrl ? [{ url: input.imageUrl }] : undefined, adminUserId: ctx.user?.id, providerMessageId: result.message_id });
+      await db.saveChatMessage({ pageId: input.pageId, threadId: input.threadId, senderId: input.recipientId, senderType: "admin", direction: "outbound", text: input.text, attachments: input.imageUrl ? [{ url: input.imageUrl }] : undefined, adminUserId: ctx.user?.id });
       return result;
     }),
     uploadImage: publicProcedure.input(z.object({ fileName: z.string(), contentType: z.string(), base64: z.string() })).mutation(async ({ input }) => {
@@ -57,24 +35,19 @@ export const appRouter = router({
     purgeExpired: adminProcedure.input(z.object({ confirmation: z.literal("DELETE_PARCELS_OLDER_THAN_3_DAYS") })).mutation(() => purgeOldParcels()),
     sendTracking: adminProcedure.input(z.object({
       pageId: z.string().min(1),
-      pageName: z.string().optional(),
-      portalKey: z.string().optional(),
-      chatLinkKey: z.string().optional(),
       threadId: z.string().min(1),
       recipientId: z.string().min(1),
       text: z.string().trim().min(1).max(2000),
     })).mutation(async ({ input, ctx }) => {
       const result = await sendMetaMessage(input);
-      void persistOutgoingChatBestEffort({ portalKey: input.portalKey, chatLinkKey: input.chatLinkKey, pageId: input.pageId, pageName: input.pageName, threadId: input.threadId, recipientId: input.recipientId, messageId: result.message_id, text: input.text });
-      void persistLocalChatBestEffort({
+      await db.saveChatMessage({
         pageId: input.pageId,
         threadId: input.threadId,
-        senderId: input.pageId,
-        senderType: "page",
+        senderId: input.recipientId,
+        senderType: "admin",
         direction: "outbound",
-      text: input.text,
-      adminUserId: ctx.user.id,
-      providerMessageId: result.message_id,
+        text: input.text,
+        adminUserId: ctx.user.id,
       });
       return result;
     }),

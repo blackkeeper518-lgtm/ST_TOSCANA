@@ -80,7 +80,7 @@ export default function CloseJobHistory() {
       <div className="absolute right-20 top-16 h-1 w-1 rounded-full bg-fuchsia-100 shadow-[0_0_10px_3px_rgba(217,70,239,.7)]" />
       <div className="relative flex flex-wrap items-start justify-between gap-4">
         <div>
-          <p className="flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.24em] text-cyan-100"><Sparkles className="h-4 w-4 text-fuchsia-200" /> ST SINGTO · ORBITAL CASE ARCHIVE</p>
+          <p className="flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.24em] text-cyan-100"><Sparkles className="h-4 w-4 text-fuchsia-200" /> BB STORE · ORBITAL CASE ARCHIVE</p>
           <h1 className="mt-2 bg-gradient-to-r from-cyan-100 via-white to-fuchsia-200 bg-clip-text text-2xl font-black tracking-tight text-transparent sm:text-3xl">ประวัติปิดงาน · ยกเลิก · ลูกค้าไม่รับ</h1>
           <p className="mt-2 max-w-3xl text-xs leading-5 text-cyan-50/75">เจอคำว่า “ปิดงาน”, “ยกเลิก”, “ไม่เอาแล้ว” หรือ “สั่งแล้วไม่รับ” ในแชทเมื่อไร เก็บไว้ให้เปิดดูย้อนหลังได้</p>
         </div>
