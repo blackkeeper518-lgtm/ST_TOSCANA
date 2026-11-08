@@ -39,12 +39,14 @@ function profileKey(_camp: Camp, project: SupabaseProject) {
   if (project === "parcel") return PARCEL_CONFIG_KEY;
   return CONFIG_KEY;
 }
-export function getSupabaseConfig(camp: Camp = getActiveCamp(), project: SupabaseProject = "main"): SupabaseConfig | null {
+export function getSupabaseConfig(camp: Camp = getActiveCamp(), project: SupabaseProject = "main", urlOverride?: string): SupabaseConfig | null {
   try {
+    const pinnedUrl = String(urlOverride ?? "").trim().replace(/\/$/, "");
     const raw = localStorage.getItem(profileKey(camp, project));
     if (raw) {
       const value = JSON.parse(raw) as Partial<SupabaseConfig>;
-      if (value.url && value.anonKey) return { url: value.url.replace(/\/$/, ""), anonKey: value.anonKey, orderTable: project === "main" ? defaultOrderView(camp) : undefined };
+      const url = pinnedUrl || String(value.url ?? "").trim().replace(/\/$/, "");
+      if (url && value.anonKey) return { url, anonKey: value.anonKey, orderTable: project === "main" ? defaultOrderView(camp) : undefined };
     }
     if (project === "chat" || project === "parcel") {
       const fallback = localStorage.getItem(TRACKING_CONFIG_KEY);
@@ -54,7 +56,7 @@ export function getSupabaseConfig(camp: Camp = getActiveCamp(), project: Supabas
       }
     }
   } catch { /* invalid local value; try deployment defaults */ }
-  const url = project === "tracking" ? DEPLOYMENT_TRACKING_URL : project === "chat" ? DEPLOYMENT_CHAT_URL || DEPLOYMENT_TRACKING_URL : project === "parcel" ? DEPLOYMENT_PARCEL_URL || DEPLOYMENT_TRACKING_URL : DEPLOYMENT_SUPABASE_URL;
+  const url = String(urlOverride ?? "").trim().replace(/\/$/, "") || (project === "tracking" ? DEPLOYMENT_TRACKING_URL : project === "chat" ? DEPLOYMENT_CHAT_URL || DEPLOYMENT_TRACKING_URL : project === "parcel" ? DEPLOYMENT_PARCEL_URL || DEPLOYMENT_TRACKING_URL : DEPLOYMENT_SUPABASE_URL);
   const anonKey = project === "tracking" ? DEPLOYMENT_TRACKING_ANON_KEY : project === "chat" ? DEPLOYMENT_CHAT_ANON_KEY || DEPLOYMENT_TRACKING_ANON_KEY : project === "parcel" ? DEPLOYMENT_PARCEL_ANON_KEY || DEPLOYMENT_TRACKING_ANON_KEY : DEPLOYMENT_SUPABASE_ANON_KEY;
   return url && anonKey ? { url, anonKey, orderTable: project === "main" ? defaultOrderView(camp) : undefined } : null;
 }
@@ -66,8 +68,8 @@ export function saveSupabaseConfig(config: SupabaseConfig, camp: Camp = getActiv
 export function clearSupabaseConfig(camp: Camp = getActiveCamp(), project: SupabaseProject = "main") {
   localStorage.removeItem(profileKey(camp, project)); delete clients[project]; delete clientSignatures[project];
 }
-export function getSupabase(project: SupabaseProject = "main") {
-  const config = getSupabaseConfig(getActiveCamp(), project);
+export function getSupabase(project: SupabaseProject = "main", urlOverride?: string) {
+  const config = getSupabaseConfig(getActiveCamp(), project, urlOverride);
   if (!config) return null;
   const signature = `${getActiveCamp()}|${config.url}|${config.anonKey}`;
   if (!clients[project] || signature !== clientSignatures[project]) {
@@ -316,6 +318,7 @@ const TELEGRAM_WEB_ORDER_COLUMNS = [
   // PIONEER and ANDROMEDA share the operational order number, but ANDROMEDA
   // does not expose the optional order_number_display column.
   "upsert_key", "source_table", "order_time_display", "order_number",
+  "balloonnotice",
   "telegram_product_display", "final_display_for_packer", "order_fibo_product", "for_packer_st_display", "manus_for_packer", "google_for_packer", "packer_tag_display", "packer_obj",
   "address_fibo_selected_clean", "address_display_packer", "full_address", "province", "zipcode", "phone", "extracted_phone",
   "cod_amount", "customer_name", "facebook_name", "page_name", "shipping_carrier", "sku",
@@ -499,7 +502,7 @@ const GENESIS_HISTORY_COLUMNS = [
   "address_display_packer", "addressclean", "province", "zipcode", "sku",
   "order_fibo_product", "for_packer_st_display", "manus_for_packer",
   "google_for_packer", "packer_tag_display", "packer_obj", "telegram_product_display",
-  "telegram_message", "original",
+  "telegram_message", "balloonnotice", "original",
   "cod_amount", "expected_cod", "shipping_carrier", "source_table", "telegram_status",
   "telegram_sent", "sent_at", "telegram_sent_at"
 ].join(",");
