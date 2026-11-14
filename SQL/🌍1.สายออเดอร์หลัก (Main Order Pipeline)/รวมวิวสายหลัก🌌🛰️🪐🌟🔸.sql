@@ -2,6 +2,12 @@
 -- ไม่ได้แก้ไขเงื่อนไขหรือลอจิกของแต่ละ View
 BEGIN;
 
+-- Ensure the source field exists before creating dependent views.
+ALTER TABLE public."🗝️HERMES_ARCHIVE"
+  ADD COLUMN IF NOT EXISTS time_slot_label text;
+ALTER TABLE public."🌀SINGULARITY_xXx_EXCHANGE"
+  ADD COLUMN IF NOT EXISTS time_slot_label text;
+
 -- คีย์กลางสำหรับเชื่อม 3 อีเมล / 3 สาย / 3 โปรเจค
 ALTER TABLE public."🗝️HERMES_ARCHIVE"
   ADD COLUMN IF NOT EXISTS chat_link_key text;
@@ -28,6 +34,7 @@ select
   h.order_date,
   h.order_time,
   h.order_time_display,
+  h.time_slot_label,
   h.day_of_week,
   h.order_time_source,
   h.page_id,
@@ -156,7 +163,8 @@ select
   h.raw_text,
   h.recipient_id,
   h.expected_cod,
-  h.telegram_bill_header
+  
+  h.telegram_bill_header,
 from
   "🗝️HERMES_ARCHIVE" h
   left join lateral (
@@ -217,6 +225,7 @@ select
   s.order_date,
   s.order_time,
   s.order_time_display,
+  s.time_slot_label,
   s.day_of_week,
   s.order_time_source,
   s.page_id,
@@ -345,7 +354,8 @@ select
   s.raw_text,
   s.recipient_id,
   s.expected_cod,
-  s.telegram_bill_header
+  s.telegram_bill_header,
+    s.time_slot_label
 from
   "🌀SINGULARITY_xXx_EXCHANGE" s
   left join lateral (
@@ -409,6 +419,7 @@ select
   order_date,
   order_time,
   order_time_display,
+  time_slot_label,
   day_of_week,
   order_time_source,
   page_id,
@@ -537,6 +548,7 @@ select
   raw_text,
   recipient_id,
   expected_cod,
+  time_slot_label,
   telegram_bill_header
 from
   "🌌MULTIVERSE_xXx_NEXUS" c
@@ -592,6 +604,7 @@ select
   order_date,
   order_time,
   order_time_display,
+  time_slot_label,
   day_of_week,
   order_time_source,
   page_id,
@@ -696,6 +709,7 @@ select
   customer_product_previous,
   source_table,
   stock_notice,
+  time_slot_label,
     telegram_change_alert_web,
   telegram_message_web
 from
@@ -720,6 +734,7 @@ select
   order_date,
   order_time,
   order_time_display,
+  time_slot_label,
   day_of_week,
   order_time_source,
   page_id,
@@ -846,6 +861,7 @@ select
   raw_text,
   recipient_id,
   expected_cod,
+   time_slot_label,
   telegram_bill_header
 from
   "🌌MULTIVERSE_xXx_NEXUS" c
@@ -1258,6 +1274,7 @@ select
   "balloonNotice",
   is_backlog,
   branch_route,
+   time_slot_label,
   telegram_message_web,
   telegram_change_alert_web
 from

@@ -4,12 +4,16 @@
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import OrderEditWorkbench from "@/components/OrderEditWorkbench";
-import { getActiveCamp,  orderTimeSortKey, readCanonicalOrders, readChatThreads, readParcelByTrackingNumber, readParcelMappingQueue } from "@/lib/canonical";
+import { getActiveCamp, mapChatRowsToThreads, orderTimeSortKey, readBbAlertRoom, readBlackboxRoom, readCanonicalOrders, readParcelByTrackingNumber, readParcelMappingQueue, readTelegramDeliveryOrders } from "@/lib/canonical";
+import { buildMetaInboxPageUrl, parseMetaChatLinkKey } from "@/lib/meta-inbox";
+import { getOrderWarnings } from "@/lib/orderWarnings";
 import { useQuery } from "@tanstack/react-query";
 import { CalendarDays, Check, CheckCircle2, Clock3, Database, Download, ExternalLink, MessageCircle, Pencil, RefreshCw, Search, Send, ShoppingCart, WalletCards, XCircle } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "wouter";
+import { trpc } from "@/lib/trpc";
 
 type CanonicalOrderRow = Record<string, any> & {
   upsert_key: string;
@@ -69,7 +73,7 @@ function exportOrdersCsv(rows: CanonicalOrderRow[]) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `st-orders-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.download = `bb-orders-${new Date().toISOString().slice(0, 10)}.csv`;
   link.click();
   URL.revokeObjectURL(url);
 }
@@ -94,22 +98,26 @@ function isSent(row: CanonicalOrderRow) {
   return String(row.delivery_status ?? "").trim().toUpperCase().replace(/^🔥\s*/, "") === "SENT" && Boolean(String(row.sent_at ?? "").trim());
 }
 
+function telegramRowIsSent(row: Record<string, any>) {
+  const statuses = [row.delivery_status, row.delivery_state, row.telegram_status].map((value) => String(value ?? "").trim().toUpperCase().replace(/^🔥\s*/, ""));
+  return Boolean(String(row.sent_at ?? row.telegram_sent_at ?? "").trim()) || statuses.some((status) => ["SENT", "DELIVERED", "SENT_TO_TELEGRAM"].includes(status)) || ["true", "t", "1", "yes"].includes(String(row.telegram_sent ?? "").trim().toLowerCase());
+}
+
+function telegramChatId(row: Record<string, any>) {
+  const raw = row.telegram_body ?? row.telegramBody;
+  let body = raw;
+  if (typeof raw === "string") {
+    try { body = JSON.parse(raw); } catch { body = null; }
+  }
+  return String(body?.chat_id ?? row.telegram_chat_id ?? row.chat_id ?? "").trim();
+}
+
 // สถานะส่งได้: แก้เงื่อนไขตรงนี้ได้ ถ้ากติกา n8n เปลี่ยน
 function canSend(row: CanonicalOrderRow) {
   return !isSent(row) && (truthy(row.is_ready_to_pack) || truthy(row.send_eligible) || truthy(row.telegram_bill_send_eligible) || String(row.cod_check_status ?? "").toUpperCase() === "PASS");
 }
 
 // ⫘ TRACKING SEARCH · เลขพัสดุหลักค้นตรง ส่วนข้อความแต่งหล่อเป็นข้อมูลเสริม
-const PAGE_BUSINESS_MAP: Record<string, string> = {
-  "103411062505149": "200213502365612",
-  "1032290633303246": "200213502365612",
-  "1047257891810878": "200213502365612",
-  "111414924711459": "200213502365612",
-  "113923148350742": "200213502365612",
-  "1064404466767377": "3106079592877973",
-  "1235719106287717": "3106079592877973",
-};
-
 function extractPureTrackingNumber(value: unknown) {
   const text = String(value ?? "").toUpperCase().replace(/[‐‑‒–—]/g, "-");
   return text.match(/\bTH[A-Z0-9]{8,20}\b/)?.[0] ?? "";
@@ -124,15 +132,14 @@ function splitTrackingInput(value: unknown) {
 function pageIdFromRow(row: Record<string, any>) {
   const direct = String(row.page_id ?? "").trim();
   if (direct) return direct;
+  const parsed = parseMetaChatLinkKey(row.chat_link_key);
+  if (parsed) return parsed.pageId;
   const key = String(row.chat_link_key ?? "");
   return key.split(":", 1)[0].trim();
 }
 
 function businessInboxUrl(row: Record<string, any>) {
-  const pageId = pageIdFromRow(row);
-  const businessId = PAGE_BUSINESS_MAP[pageId];
-  if (!pageId || !businessId) return "";
-  return `https://business.facebook.com/latest/inbox/all/?business_id=${encodeURIComponent(businessId)}&asset_id=${encodeURIComponent(pageId)}`;
+  return buildMetaInboxPageUrl(pageIdFromRow(row));
 }
 
 // ⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘
@@ -141,14 +148,14 @@ function businessInboxUrl(row: Record<string, any>) {
 // ถ้าจะเปลี่ยนพื้นหลัง/ระยะห่าง/ขนาดหน้า ให้แก้ className ในส่วนนี้
 // ⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘⫘
 export default function OrderControl() {
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => new URLSearchParams(window.location.search).get("search") ?? "");
   const [fromDate, setFromDate] = useState("");
   const [untilDate, setUntilDate] = useState("");
   const [pageFilter, setPageFilter] = useState("ทั้งหมด");
   const [selectedKey, setSelectedKey] = useState("");
   const [clock, setClock] = useState(() => new Date());
   const [copied, setCopied] = useState(false);
-  const [searchPanelOpen, setSearchPanelOpen] = useState(false);
+  const [searchPanelOpen, setSearchPanelOpen] = useState(() => new URLSearchParams(window.location.search).get("universal") === "1");
   const [trackingCopied, setTrackingCopied] = useState("");
   const [editOpen, setEditOpen] = useState(false);
   const trackingInput = splitTrackingInput(search);
@@ -171,17 +178,46 @@ export default function OrderControl() {
     enabled: searchPanelOpen && Boolean(trackingInput.pure),
     staleTime: 15_000,
   });
-  const chatThreadsQuery = useQuery({
-    queryKey: ["order-control-chat-search", getActiveCamp()],
-    queryFn: () => readChatThreads(),
+  const chatThreadsQuery = trpc.chat.threads.useQuery(undefined, {
     enabled: searchPanelOpen && trackingSearchReady,
     staleTime: 60_000,
+    select: mapChatRowsToThreads,
+  });
+  const telegramQueueQuery = useQuery({
+    queryKey: ["order-control-telegram-queue", getActiveCamp(), search.trim()],
+    queryFn: () => readTelegramDeliveryOrders(search, "queue"),
+    enabled: searchPanelOpen && trackingSearchReady,
+    staleTime: 15_000,
+  });
+  const telegramSentQuery = useQuery({
+    queryKey: ["order-control-telegram-sent", getActiveCamp(), search.trim()],
+    queryFn: () => readTelegramDeliveryOrders(search, "sent"),
+    enabled: searchPanelOpen && trackingSearchReady,
+    staleTime: 15_000,
+  });
+  const paradoxQuery = useQuery({
+    queryKey: ["order-control-paradox-trace", getActiveCamp(), search.trim()],
+    queryFn: () => readBbAlertRoom(search),
+    enabled: searchPanelOpen && trackingSearchReady,
+    staleTime: 15_000,
+  });
+  const blackboxQuery = useQuery({
+    queryKey: ["order-control-blackbox-trace", getActiveCamp(), search.trim()],
+    queryFn: () => readBlackboxRoom(search),
+    enabled: searchPanelOpen && trackingSearchReady,
+    staleTime: 15_000,
   });
   // ⫘ ORDER SORT · ใช้ CENTRAL ORDER CLOCK เรียงล่าสุดไว้บนสุดเสมอ
-  const rawOrders = [...((query.data?.orders ?? []) as CanonicalOrderRow[])].sort((a, b) => orderTimeSortKey(b.order_time_display) - orderTimeSortKey(a.order_time_display));
-  const pageNames = Array.from(new Set(rawOrders.map((row) => String(row.page_name ?? "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, "th"));
-  const orders = pageFilter === "ทั้งหมด" ? rawOrders : rawOrders.filter((row) => String(row.page_name ?? "").trim() === pageFilter);
+  const rawOrders = useMemo(() => [...((query.data?.orders ?? []) as CanonicalOrderRow[])].sort((a, b) => orderTimeSortKey(b.order_time_display) - orderTimeSortKey(a.order_time_display)), [query.data?.orders]);
+  const pageNames = useMemo(() => Array.from(new Set(rawOrders.map((row) => String(row.page_name ?? "").trim()).filter(Boolean))).sort((a, b) => a.localeCompare(b, "th")), [rawOrders]);
+  const orders = useMemo(() => pageFilter === "ทั้งหมด" ? rawOrders : rawOrders.filter((row) => String(row.page_name ?? "").trim() === pageFilter), [pageFilter, rawOrders]);
   const selectedOrder = orders.find((row) => row.upsert_key === selectedKey) ?? orders[0] ?? null;
+  const orderWarningsByKey = useMemo(() => new Map(orders.map((row) => [row.upsert_key, getOrderWarnings(row)])), [orders]);
+  const selectedOrderWarnings = selectedOrder ? orderWarningsByKey.get(selectedOrder.upsert_key) ?? getOrderWarnings(selectedOrder) : [];
+  const orderWarningRows = Array.from(orderWarningsByKey.values()).filter((warnings) => warnings.length > 0);
+  const blockedWarningCount = orderWarningRows.reduce((count, warnings) => count + warnings.filter((warning) => warning.severity === "BLOCK").length, 0);
+  const reviewWarningCount = orderWarningRows.reduce((count, warnings) => count + warnings.filter((warning) => warning.severity === "REVIEW").length, 0);
+  const warnedOrderCount = orderWarningRows.length;
   const trackingTerm = trackingInput.raw.toLowerCase();
   const phoneSearch = /^[+\d\s().-]+$/.test(search.trim()) ? normalizePhoneForSearch(search) : "";
   const fallbackTrackingRows = (trackingQueueQuery.data ?? []).filter((row: any) => {
@@ -197,12 +233,16 @@ export default function OrderControl() {
   const trackingRows = trackingInput.pure && directParcelQuery.data?.length ? directParcelQuery.data : fallbackTrackingRows;
   const matchingChatThreads = (chatThreadsQuery.data ?? []).filter((thread: any) => {
     if (!trackingTerm) return false;
-    const haystack = [thread.chatLinkKey, thread.key, thread.customerPhone, thread.customerName, thread.customerId, thread.pageName, thread.preview, ...(thread.chatTimeline ?? [])]
+    const haystack = [thread.chatLinkKey, thread.key, thread.customerPhone, thread.phone, thread.customerName, thread.customerId, thread.pageName, thread.preview, thread.order_number, thread.order_number_display, thread.latestOrderNumber, thread.upsert_key, thread.searchText, ...(thread.chatTimeline ?? [])]
       .map((value) => String(value ?? "").trim().toLowerCase()).join(" ");
-    const phoneDigits = normalizePhoneForSearch(thread.customerPhone);
+    const phoneDigits = [thread.customerPhone, thread.phone].map(normalizePhoneForSearch).join(" ");
     return haystack.includes(trackingTerm) || (phoneSearch.length >= 7 && phoneDigits.includes(phoneSearch));
-  }).slice(0, 8);
-  const isRefreshing = query.isFetching || trackingQueueQuery.isFetching || directParcelQuery.isFetching || chatThreadsQuery.isFetching;
+  });
+  const telegramTraceRows = [
+    ...(telegramSentQuery.data?.orders ?? []).map((row: any) => ({ ...row, _traceRoom: "sent" })),
+    ...(telegramQueueQuery.data?.orders ?? []).map((row: any) => ({ ...row, _traceRoom: "queue" })),
+  ].slice(0, 12);
+  const isRefreshing = query.isFetching || trackingQueueQuery.isFetching || directParcelQuery.isFetching || chatThreadsQuery.isFetching || telegramQueueQuery.isFetching || telegramSentQuery.isFetching;
   const todayOrders = orders.filter(isToday);
   const sentOrders = orders.filter(isSent);
   const sendableOrders = orders.filter(canSend);
@@ -239,7 +279,7 @@ export default function OrderControl() {
         <div className="hero-scanline" />
         <div className="relative z-10 max-w-3xl">
           <p className="orbit-kicker flex items-center gap-2 text-cyan-200/80"><Database className="h-3.5 w-3.5 text-cyan-300" /> ศูนย์ควบคุมออเดอร์จาก n8n ·</p>
-          <h1 className="cyber-title mt-2 text-2xl font-semibold tracking-tight text-white sm:text-3xl">ORDER CONTROL <span className="text-cyan-300">✦</span> ST SINGTO STORE</h1>
+          <h1 className="cyber-title mt-2 text-2xl font-semibold tracking-tight text-white sm:text-3xl">ORDER CONTROL <span className="text-cyan-300">✦</span> BB STORE</h1>
           <p className="mt-1 max-w-2xl text-xs leading-5 text-slate-300/75">เห็นต้นทาง สถานะ และเวลาจริงในจอเดียว</p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <span className="live-chip"><span className="live-dot" /> LIVE ORDER STREAM</span>
@@ -252,82 +292,140 @@ export default function OrderControl() {
         <div className="central-clock hero-clock relative z-10"><span className="central-clock-label">ORDER_TIME_DISPLAY · BANGKOK</span><strong>{clock.toLocaleTimeString("th-TH", { timeZone: "Asia/Bangkok", hour: "2-digit", minute: "2-digit", second: "2-digit" })}</strong><span className="central-clock-date">{clock.toLocaleDateString("th-TH", { timeZone: "Asia/Bangkok", weekday: "long", day: "numeric", month: "long", year: "numeric" })}</span><small>ศูนย์เวลาออเดอร์จาก n8n · ไม่ใช้เวลาระบบ</small></div>
       </header>
 
-      {/* UNIVERSAL SEARCH DRAWER · ช่องเดียวค้นคลังออเดอร์และคิวพัสดุที่เชื่อมอยู่ */}
-      <section className="order-search-drawer overflow-hidden rounded-2xl border border-cyan-300/20 bg-[#05070d]/95 shadow-[0_0_22px_rgba(76,236,255,0.06)]">
-        <div className="order-search-head p-3 sm:p-4">
-          <div className="order-search-topline mb-3 flex flex-wrap items-center justify-between gap-2">
-            <label htmlFor="order-universal-search" className="order-search-label flex min-w-0 flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em]">
-              <span className="order-search-label-icon"><Search className="h-3.5 w-3.5" /></span>
-              <span>ค้นหาออเดอร์และพัสดุ</span>
-              <span className="order-search-phone-badge">เบอร์โทรเป็นหลัก</span>
-            </label>
-            <Button type="button" variant="outline" aria-expanded={searchPanelOpen} onClick={() => setSearchPanelOpen((open) => !open)} className="order-search-toggle h-9 justify-between gap-3 whitespace-nowrap px-3">
-              <span>{searchPanelOpen ? "ซ่อนตัวกรอง / ผลพัสดุ" : "ตัวกรอง / ผลพัสดุ"}</span><span className="font-mono text-lg leading-none">{searchPanelOpen ? "−" : "+"}</span>
+      {/* SEARCH / FILTERS · แผงลิ้นชักสไลด์เข้าจากด้านขวา */}
+      <Sheet open={searchPanelOpen} onOpenChange={setSearchPanelOpen}>
+        <div className="flex justify-end">
+          <SheetTrigger asChild>
+            <Button type="button" variant="outline" aria-label="เปิดค้นหาและตัวกรองจากด้านขว" className="order-search-toggle flex h-10 items-center gap-2 px-4">
+              <Search className="h-4 w-4 text-cyan-200" />
+              <span>UNIVERSAL SEARCH</span>
+              {search.trim() ? <span className="max-w-[160px] truncate rounded-full border border-cyan-200/20 bg-cyan-300/[.08] px-2 py-0.5 text-[10px] normal-case tracking-normal">{search.trim()}</span> : null}
+              <span className="rounded-full border border-fuchsia-200/20 bg-fuchsia-300/[.07] px-2 py-0.5 text-[9px] text-fuchsia-100/80">เปิดจากขวา</span>
             </Button>
-          </div>
-          <div className="order-search-input-shell">
-            <Search aria-hidden="true" className="order-search-input-icon h-4 w-4" />
-            <Input id="order-universal-search" value={search} onChange={(event) => { setSearch(event.target.value); if (event.target.value.trim()) setSearchPanelOpen(true); }} placeholder="เบอร์โทรศัพท์ · ชื่อลูกค้า · เลขออเดอร์ · SKU · chat_link_key · เลขพัสดุ" className="order-search-input h-12 w-full rounded-xl border text-sm text-white placeholder:text-slate-500" />
-          </div>
-          <p className="order-search-helper mt-2 text-[10px] leading-4">ค้น HERMES · Chat · Parcel ด้วยเบอร์โทรหรือ chat_link_key · วันที่/เพจใช้กรองรายการออเดอร์</p>
+          </SheetTrigger>
         </div>
-        {searchPanelOpen ? <div id="order-search-filters" className="grid grid-rows-[1fr] border-t border-cyan-300/15 transition-all duration-300">
-          <div className="min-h-0 p-3 sm:p-4">
-            <div className="order-filter-bar mb-3 rounded-2xl border border-cyan-300/15 bg-black/25 p-3">
-              <div className="order-filter-fields flex flex-wrap items-end gap-2">
-                <label className="filter-field filter-field-date"><span>ตั้งแต่</span><input type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} /></label>
-                <label className="filter-field filter-field-date"><span>ถึง</span><input type="date" value={untilDate} onChange={(event) => setUntilDate(event.target.value)} /></label>
-                <label className="filter-field filter-field-page"><span>เพจ</span><select value={pageFilter} onChange={(event) => setPageFilter(event.target.value)}><option value="ทั้งหมด">ทุกเพจ</option>{pageNames.map((page) => <option key={page} value={page}>{page}</option>)}</select></label>
+        <SheetContent side="right" className="order-control-room flex w-[min(860px,100vw)] flex-col gap-0 overflow-hidden border-l border-cyan-300/25 bg-[#05070d] p-0 text-white shadow-[-18px_0_60px_rgba(34,211,238,.12)] sm:max-w-[860px]">
+          <SheetHeader className="border-b border-cyan-300/15 bg-gradient-to-r from-violet-500/[.10] via-cyan-400/[.05] to-transparent pr-14">
+            <SheetTitle className="text-left text-sm font-bold tracking-[.14em] text-cyan-100">UNIVERSAL SEARCH · ORDER CONTROL</SheetTitle>
+            <SheetDescription className="text-left text-xs leading-5 text-slate-300/70">ค้นด้วยเบอร์โทรหรือเลขออเดอร์ แล้วตรวจ HERMES · Chat · Parcel · Telegram ในแผงด้านขวานี้</SheetDescription>
+          </SheetHeader>
+          <section className="order-search-drawer min-h-0 flex-1 overflow-y-auto rounded-none border-0">
+          <div className="order-search-head p-3 sm:p-4">
+              <div className="order-search-topline mb-3 flex flex-wrap items-center gap-2">
+                <label htmlFor="order-universal-search" className="order-search-label flex min-w-0 flex-wrap items-center gap-2 text-[10px] font-semibold uppercase tracking-[0.16em]">
+                  <span className="order-search-label-icon"><Search className="h-3.5 w-3.5" /></span>
+                  <span>ค้นหาออเดอร์และพัสดุ</span>
+                  <span className="order-search-phone-badge">เบอร์โทรเป็นหลัก</span>
+                </label>
               </div>
-              <div className="order-filter-actions mt-3 flex flex-wrap justify-end gap-2 border-t border-white/[0.06] pt-3">
-                <Button type="button" variant="outline" onClick={() => { void query.refetch(); if (searchPanelOpen && trackingSearchReady) { void trackingQueueQuery.refetch(); void chatThreadsQuery.refetch(); } if (searchPanelOpen && trackingInput.pure) void directParcelQuery.refetch(); }} disabled={isRefreshing} className="order-refresh-action"><RefreshCw className={`mr-2 h-3.5 w-3.5 ${isRefreshing ? "animate-spin" : ""}`} />{isRefreshing ? "กำลังอัปเดต" : "อัปเดตข้อมูล"}</Button>
-                <Button type="button" variant="outline" onClick={() => exportOrdersCsv(orders)} className="border-cyan-300/30 bg-cyan-400/5 text-cyan-100 hover:bg-cyan-400/15"><Download className="mr-2 h-4 w-4" />เอ็กซ์พอร์ต {orders.length} รายการ</Button>
-                <Button type="button" variant="outline" onClick={() => { setSearch(""); setFromDate(""); setUntilDate(""); setPageFilter("ทั้งหมด"); }} className="border-violet-300/25 bg-violet-400/5 text-violet-100 hover:bg-violet-400/15">ล้างตัวเลือก</Button>
+            <div className="order-search-input-shell">
+              <Search aria-hidden="true" className="order-search-input-icon h-4 w-4" />
+              <Input id="order-universal-search" value={search} onChange={(event) => { setSearch(event.target.value); if (event.target.value.trim()) setSearchPanelOpen(true); }} placeholder="เบอร์โทรศัพท์ · ชื่อลูกค้า · เลขออเดอร์ · SKU · chat_link_key · เลขพัสดุ" className="order-search-input h-12 w-full rounded-xl border text-sm text-white placeholder:text-slate-500" />
+            </div>
+            <p className="order-search-helper mt-2 text-[10px] leading-4">ค้น HERMES · Chat · Parcel · Telegram ด้วยเบอร์โทร เลขออเดอร์ หรือ chat_link_key · วันที่/เพจใช้กรองรายการออเดอร์</p>
+          </div>
+          {searchPanelOpen ? <div id="order-search-filters" className="grid grid-rows-[1fr] border-t border-cyan-300/15 transition-all duration-300">
+            <div className="min-h-0 p-3 sm:p-4">
+              <div className="order-filter-bar mb-3 rounded-2xl border border-cyan-300/15 bg-black/25 p-3">
+                <div className="order-filter-fields flex flex-wrap items-end gap-2">
+                  <label className="filter-field filter-field-date"><span>ตั้งแต่</span><input type="date" value={fromDate} onChange={(event) => setFromDate(event.target.value)} /></label>
+                  <label className="filter-field filter-field-date"><span>ถึง</span><input type="date" value={untilDate} onChange={(event) => setUntilDate(event.target.value)} /></label>
+                  <label className="filter-field filter-field-page"><span>เพจ</span><select value={pageFilter} onChange={(event) => setPageFilter(event.target.value)}><option value="ทั้งหมด">ทุกเพจ</option>{pageNames.map((page) => <option key={page} value={page}>{page}</option>)}</select></label>
+                </div>
+                <div className="order-filter-actions mt-3 flex flex-wrap justify-end gap-2 border-t border-white/[0.06] pt-3">
+                  <Button type="button" variant="outline" onClick={() => { void query.refetch(); if (searchPanelOpen && trackingSearchReady) { void trackingQueueQuery.refetch(); void chatThreadsQuery.refetch(); void telegramQueueQuery.refetch(); void telegramSentQuery.refetch(); } if (searchPanelOpen && trackingInput.pure) void directParcelQuery.refetch(); }} disabled={isRefreshing} className="order-refresh-action"><RefreshCw className={`mr-2 h-3.5 w-3.5 ${isRefreshing ? "animate-spin" : ""}`} />{isRefreshing ? "กำลังอัปเดต" : "อัปเดตข้อมูล"}</Button>
+                  <Button type="button" variant="outline" onClick={() => exportOrdersCsv(orders)} className="border-cyan-300/30 bg-cyan-400/5 text-cyan-100 hover:bg-cyan-400/15"><Download className="mr-2 h-4 w-4" />เอ็กซ์พอร์ต {orders.length} รายการ</Button>
+                  <Button type="button" variant="outline" onClick={() => { setSearch(""); setFromDate(""); setUntilDate(""); setPageFilter("ทั้งหมด"); }} className="border-violet-300/25 bg-violet-400/5 text-violet-100 hover:bg-violet-400/15">ล้างตัวเลือก</Button>
+                </div>
               </div>
-            </div>
-            <div className="order-search-result-summary mb-3 flex flex-col justify-between gap-2 rounded-xl border border-cyan-300/10 bg-black/20 px-3 py-2 sm:flex-row sm:items-center">
-              <span className="text-[10px] text-slate-400">{query.isFetching ? "กำลังค้นออเดอร์…" : `ออเดอร์ที่ตรง ${orders.length} รายการ`} · {trackingInput.raw ? `พัสดุ ${trackingRows.length} · แชท ${matchingChatThreads.length}` : "พิมพ์เบอร์เพื่อค้นทั้ง 3 แหล่ง"}</span>
-              <span className="text-[10px] text-cyan-100/65">{isRefreshing ? "กำลังค้นข้อมูลจาก HERMES · Chat · Parcel…" : !trackingInput.raw ? "ค้นได้ด้วยเบอร์ / ชื่อ / เลขออเดอร์ / SKU / chat_link_key / เลขพัสดุ" : !trackingSearchReady ? "พิมพ์อย่างน้อย 3 ตัวอักษรเพื่อค้นทุกแหล่ง" : trackingInput.pure ? `เลขพัสดุตรง ${trackingRows.length} · แชทที่ตรง ${matchingChatThreads.length}` : `พัสดุที่ตรง ${trackingRows.length} · แชทที่ตรง ${matchingChatThreads.length}`}</span>
-            </div>
-            {trackingInput.isDecorated ? <p className="mt-2 rounded-lg border border-fuchsia-300/15 bg-fuchsia-400/[0.04] px-3 py-2 text-[10px] text-fuchsia-100/75">ตรวจพบข้อความแต่งหล่อ · ระบบแยกเลขหลัก <span className="font-mono font-semibold text-fuchsia-100">{trackingInput.pure}</span> ไปค้นใน parcels โดยตรง</p> : null}
-            {!trackingInput.raw ? <p className="order-search-empty mb-3 rounded-xl border border-violet-300/10 bg-violet-400/[0.025] p-3 text-center text-[11px] text-slate-400">เริ่มจากเบอร์โทรได้เลย · ระบบจะแสดงออเดอร์ที่ตรงด้านล่าง และค้นคิวพัสดุในแผงนี้</p> : null}
-            {trackingQueueQuery.isError ? <p className="mt-3 rounded-xl border border-pink-300/20 bg-pink-400/[0.04] p-3 text-xs text-pink-200">ค้นคิวพัสดุไม่สำเร็จ: {trackingQueueQuery.error instanceof Error ? trackingQueueQuery.error.message : String(trackingQueueQuery.error)}</p> : null}
-            {directParcelQuery.isError ? <p className="mt-3 rounded-xl border border-pink-300/20 bg-pink-400/[0.04] p-3 text-xs text-pink-200">ค้น parcels โดยตรงไม่สำเร็จ: {directParcelQuery.error instanceof Error ? directParcelQuery.error.message : String(directParcelQuery.error)}</p> : null}
-            {chatThreadsQuery.isError ? <p className="mt-3 rounded-xl border border-violet-300/20 bg-violet-400/[0.04] p-3 text-xs text-violet-100">ค้นโปรเจกต์ Chat ไม่สำเร็จ: {chatThreadsQuery.error instanceof Error ? chatThreadsQuery.error.message : String(chatThreadsQuery.error)}</p> : null}
-            {trackingTerm && trackingSearchReady && !trackingQueueQuery.isFetching && !trackingQueueQuery.isError && trackingRows.length === 0 ? <p className="mt-3 p-3 text-center text-xs text-slate-500">ไม่พบรายการในคิวพัสดุที่โหลดได้</p> : null}
-            <div className="mt-3 grid max-h-80 gap-2 overflow-y-auto lg:grid-cols-2">
-              {trackingRows.map((row: any, index: number) => {
-                const trackingNo = extractPureTrackingNumber(row.tracking_number) || String(row.tracking_number ?? "").trim();
-                const displayName = String(row.recipient_name || row.consignee || row.customer_name || "ไม่ระบุชื่อ");
-                const displayPhone = String(row.matched_phone || row.phone_number || row.order_phone || row.phone || "").trim();
-                const message = String(row.drakside_tracking_message || row.facebook_tracking_message || "").trim();
-                const copyKey = `${trackingNo}:${index}`;
-                const inboxUrl = businessInboxUrl(row);
-                return <article key={copyKey} className="order-parcel-result rounded-xl border p-3">
-                  <div className="flex flex-wrap items-start justify-between gap-2"><div><p className="font-mono text-sm font-semibold text-cyan-100">{trackingNo || "ไม่มีเลขพัสดุ"}</p><p className="mt-1 text-xs text-slate-200">{displayName}{displayPhone ? ` · ${displayPhone}` : ""}</p></div><span className="text-[10px] text-violet-200/75">{String(row.page_name || "ไม่ระบุเพจ")}</span></div>
-                  <p className="mt-1 text-[10px] text-slate-400">{String(row.order_number_display || row.order_number || "ไม่พบเลขออเดอร์")} · {String(row.pickup_date || row.order_time_display || "ไม่ระบุวันเวลา")} · COD {String(row.cod_amount ?? "—")} บาท</p>
-                  <div className="mt-2 flex flex-wrap gap-2"><span className="rounded-md border border-cyan-300/15 bg-cyan-400/[0.04] px-2 py-1 text-[9px] text-cyan-100/65">ค้นตรง: parcels.tracking_number</span>{row.chat_link_key ? <span className="rounded-md border border-violet-300/15 bg-violet-400/[0.04] px-2 py-1 font-mono text-[9px] text-violet-100/70">{String(row.chat_link_key)}</span> : null}</div>
-                  {inboxUrl ? <a href={inboxUrl} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center rounded-lg border border-cyan-300/25 bg-cyan-400/[0.06] px-3 py-1.5 text-[10px] font-semibold text-cyan-100 transition hover:border-cyan-200/60 hover:bg-cyan-400/15"><ExternalLink className="mr-1.5 h-3.5 w-3.5" />เปิด Inbox จริง</a> : <p className="mt-2 text-[10px] text-amber-200/70">ยังไม่มี Business mapping ของเพจนี้</p>}
-                  {message ? <div className="mt-2 flex items-start gap-2"><pre className="max-h-24 min-w-0 flex-1 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-fuchsia-300/15 bg-black/25 p-2 text-[10px] leading-4 text-fuchsia-50/85">{message}</pre><Button type="button" size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(message).then(() => { setTrackingCopied(copyKey); window.setTimeout(() => setTrackingCopied(""), 1400); }); }} className="shrink-0 border-fuchsia-300/25 bg-fuchsia-400/[0.04] px-2 text-[10px] text-fuchsia-100">{trackingCopied === copyKey ? "คัดลอกแล้ว" : "คัดลอก"}</Button></div> : <p className="mt-2 text-[10px] text-slate-500">ไม่มีข้อความแจ้งพัสดุที่บันทึกไว้</p>}
-                </article>;
-              })}
-            </div>
-            {matchingChatThreads.length ? <div className="mt-4">
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[0.18em] text-violet-100">ผลจาก Chat · {matchingChatThreads.length} ห้อง</h3><span className="text-[9px] text-slate-500">จับคู่ด้วยเบอร์ / chat_link_key / ข้อความ</span></div>
-              <div className="grid gap-2 lg:grid-cols-2">
-                {matchingChatThreads.map((thread: any) => {
-                  const chatSearch = String(thread.customerName || thread.customerPhone || thread.chatLinkKey || thread.threadId || search);
-                  return <article key={thread.key} className="order-chat-match rounded-xl border p-3">
-                    <div className="flex flex-wrap items-start justify-between gap-2"><div><p className="text-xs font-semibold text-white">{String(thread.customerName || "ไม่ระบุชื่อลูกค้า")}</p><p className="mt-1 font-mono text-[10px] text-cyan-100/80">{String(thread.customerPhone || "ไม่พบเบอร์ในแชท")}</p></div><span className="text-[10px] text-violet-200/75">{String(thread.pageName || "ไม่ระบุเพจ")}</span></div>
-                    <p className="mt-2 line-clamp-2 text-[10px] leading-4 text-slate-300">{String(thread.preview || "ไม่มีข้อความตัวอย่าง")}</p>
-                    <div className="mt-2 flex flex-wrap items-center justify-between gap-2"><span className="max-w-full truncate font-mono text-[9px] text-violet-200/70">{thread.chatLinkKey ? `chat_link_key · ${String(thread.chatLinkKey)}` : `thread key · ${String(thread.key)}`}</span><Link href={`/chats?search=${encodeURIComponent(chatSearch)}`} className="inline-flex items-center gap-1 rounded-lg border border-cyan-300/20 bg-cyan-400/[0.04] px-2.5 py-1.5 text-[10px] font-semibold text-cyan-100 hover:bg-cyan-400/[0.1]">เปิดห้องแชท <ExternalLink className="h-3 w-3" /></Link></div>
+              <div className="order-search-result-summary mb-3 flex flex-col justify-between gap-2 rounded-xl border border-cyan-300/10 bg-black/20 px-3 py-2 sm:flex-row sm:items-center">
+                <span className="text-[10px] text-slate-400">{query.isFetching ? "กำลังค้นออเดอร์…" : `ออเดอร์ที่ตรง ${orders.length} รายการ`} · {trackingInput.raw ? `พัสดุ ${trackingRows.length} · แชท ${matchingChatThreads.length} · Telegram ${telegramTraceRows.length}` : "พิมพ์เบอร์เพื่อค้นทั้ง 4 แหล่ง"}</span>
+                <span className="text-[10px] text-cyan-100/65">{isRefreshing ? "กำลังค้นข้อมูลจาก HERMES · Chat · Parcel · Telegram…" : !trackingInput.raw ? "ค้นได้ด้วยเบอร์ / ชื่อ / เลขออเดอร์ / SKU / chat_link_key / เลขพัสดุ" : !trackingSearchReady ? "พิมพ์อย่างน้อย 3 ตัวอักษรเพื่อค้นทุกแหล่ง" : trackingInput.pure ? `เลขพัสดุตรง ${trackingRows.length} · แชท ${matchingChatThreads.length} · Telegram ${telegramTraceRows.length}` : `พัสดุ ${trackingRows.length} · แชท ${matchingChatThreads.length} · Telegram ${telegramTraceRows.length}`}</span>
+              </div>
+              {trackingInput.isDecorated ? <p className="mt-2 rounded-lg border border-fuchsia-300/15 bg-fuchsia-400/[0.04] px-3 py-2 text-[10px] text-fuchsia-100/75">ตรวจพบข้อความแต่งหล่อ · ระบบแยกเลขหลัก <span className="font-mono font-semibold text-fuchsia-100">{trackingInput.pure}</span> ไปค้นใน parcels โดยตรง</p> : null}
+              {!trackingInput.raw ? <p className="order-search-empty mb-3 rounded-xl border border-violet-300/10 bg-violet-400/[0.025] p-3 text-center text-[11px] text-slate-400">เริ่มจากเบอร์โทรได้เลย · ระบบจะแสดงออเดอร์ที่ตรงด้านล่าง และค้นคิวพัสดุในแผงนี้</p> : null}
+              <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                <article className="order-dna-card rounded-2xl border border-fuchsia-300/25 bg-fuchsia-400/[.035] p-3">
+                  <div className="flex items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[.18em] text-fuchsia-100">01 · ORDER CONTROL · HERMES</h3><span className="rounded-full border border-fuchsia-300/25 px-2 py-1 text-[9px] text-fuchsia-100/70">{orders.length} รายการ</span></div>
+                  <div className="mt-2 space-y-2">{orders.slice(0, 4).map((row) => <div key={row.upsert_key} className="rounded-xl border border-white/10 bg-black/20 p-2 text-[10px]"><div className="flex justify-between gap-2"><b className="font-mono text-cyan-100">{directText(row.order_number)}</b><span className="text-violet-200/60">{directText(row.order_time_display)}</span></div><p className="mt-1 text-white">{directText(row.customer_name)} · {directText(row.phone)}</p><p className="mt-1 text-amber-100/80">{money(row.cod_amount)} · {directText(row.page_name)}</p></div>)}</div>
+                  {orders.length > 4 ? <p className="mt-2 text-[9px] text-slate-500">แสดง 4 รายการล่าสุด · รายการที่เหลือดูได้ที่ Order Control</p> : null}
+                </article>
+                <article className="order-dna-card rounded-2xl border border-pink-300/25 bg-pink-400/[.035] p-3">
+                  <div className="flex items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[.18em] text-pink-100">02 · CHANGE HISTORY · PARADOX</h3><span className="rounded-full border border-pink-300/25 px-2 py-1 text-[9px] text-pink-100/70">{paradoxQuery.data?.length ?? 0} รายการ</span></div>
+                  <div className="mt-2 space-y-2">{(paradoxQuery.data ?? []).slice(0, 4).map((row: any, index: number) => <div key={`${row.upsert_key || row.id}-${index}`} className="rounded-xl border border-white/10 bg-black/20 p-2 text-[10px]"><b className="font-mono text-pink-100">{directText(row.order_number_display || row.order_number || row.upsert_key)}</b><p className="mt-1 text-white">{directText(row.customer_name || row.facebook_name)} · {directText(row.phone || row.extracted_phone)}</p><p className="mt-1 line-clamp-2 text-pink-100/65">{directText(row.customer_change_summary || row.customer_change_admin_footer_text || row.original || row.new)}</p></div>)}</div>
+                  {!paradoxQuery.data?.length && !paradoxQuery.isFetching ? <p className="mt-3 text-[10px] text-slate-500">ไม่พบรอยเปลี่ยนของจากเบอร์นี้</p> : null}
+                </article>
+                <article className="order-dna-card rounded-2xl border border-rose-300/25 bg-rose-400/[.035] p-3">
+                  <div className="flex items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[.18em] text-rose-100">03 · BLACKBOX · THANATOS</h3><span className="rounded-full border border-rose-300/25 px-2 py-1 text-[9px] text-rose-100/70">{blackboxQuery.data?.length ?? 0} รายการ</span></div>
+                  <div className="mt-2 space-y-2">{(blackboxQuery.data ?? []).slice(0, 4).map((row: any, index: number) => <div key={`${row.upsert_key || row.id}-${index}`} className="rounded-xl border border-white/10 bg-black/20 p-2 text-[10px]"><b className="font-mono text-rose-100">{directText(row.order_number_display || row.order_number || row.upsert_key)}</b><p className="mt-1 text-white">{directText(row.customer_name || row.facebook_name)} · {directText(row.phone || row.extracted_phone)}</p><p className="mt-1 line-clamp-2 text-rose-100/65">{directText(row.alert_status || row.reason || row.last_chat_text || row.telegram_actual_bill)}</p></div>)}</div>
+                  {!blackboxQuery.data?.length && !blackboxQuery.isFetching ? <p className="mt-3 text-[10px] text-slate-500">ไม่พบรอย Blackbox จากเบอร์นี้</p> : null}
+                </article>
+              </div>
+              <div className="mt-3 grid gap-3 lg:grid-cols-3">
+                <article className="order-dna-card rounded-2xl border border-violet-300/25 bg-violet-400/[.035] p-3"><h3 className="text-[10px] font-bold uppercase tracking-[.18em] text-violet-100">04 · CHAT · MESSENGER</h3><p className="mt-3 text-2xl font-semibold text-cyan-100">{matchingChatThreads.length}</p><p className="text-[10px] text-slate-400">ห้องแชทที่จับคู่กับเบอร์นี้</p></article>
+                <article className="order-dna-card rounded-2xl border border-cyan-300/25 bg-cyan-400/[.035] p-3"><h3 className="text-[10px] font-bold uppercase tracking-[.18em] text-cyan-100">05 · PARCEL · TRACKING</h3><p className="mt-3 text-2xl font-semibold text-cyan-100">{trackingRows.length}</p><p className="text-[10px] text-slate-400">รอยเลขพัสดุที่จับคู่ได้</p></article>
+                <article className="order-dna-card rounded-2xl border border-sky-300/25 bg-sky-400/[.035] p-3"><h3 className="text-[10px] font-bold uppercase tracking-[.18em] text-sky-100">06 · TELEGRAM · PIONEER / GENESIS</h3><p className="mt-3 text-2xl font-semibold text-sky-100">{telegramTraceRows.length}</p><p className="text-[10px] text-slate-400">คิวพักและประวัติส่งแล้ว</p></article>
+              </div>
+              {trackingQueueQuery.isError ? <p className="mt-3 rounded-xl border border-pink-300/20 bg-pink-400/[0.04] p-3 text-xs text-pink-200">ค้นคิวพัสดุไม่สำเร็จ: {trackingQueueQuery.error instanceof Error ? trackingQueueQuery.error.message : String(trackingQueueQuery.error)}</p> : null}
+              {directParcelQuery.isError ? <p className="mt-3 rounded-xl border border-pink-300/20 bg-pink-400/[0.04] p-3 text-xs text-pink-200">ค้น parcels โดยตรงไม่สำเร็จ: {directParcelQuery.error instanceof Error ? directParcelQuery.error.message : String(directParcelQuery.error)}</p> : null}
+              {chatThreadsQuery.isError ? <p className="mt-3 rounded-xl border border-violet-300/20 bg-violet-400/[0.04] p-3 text-xs text-violet-100">ค้นโปรเจกต์ Chat ไม่สำเร็จ: {chatThreadsQuery.error instanceof Error ? chatThreadsQuery.error.message : String(chatThreadsQuery.error)}</p> : null}
+              {telegramQueueQuery.isError || telegramSentQuery.isError ? <p className="mt-3 rounded-xl border border-sky-300/20 bg-sky-400/[0.04] p-3 text-xs text-sky-100">ตรวจคิว/ประวัติ Telegram ไม่สำเร็จ: {telegramQueueQuery.error instanceof Error ? telegramQueueQuery.error.message : telegramSentQuery.error instanceof Error ? telegramSentQuery.error.message : "ไม่ทราบสาเหตุ"}</p> : null}
+              {trackingTerm && trackingSearchReady && !trackingQueueQuery.isFetching && !trackingQueueQuery.isError && trackingRows.length === 0 ? <p className="mt-3 p-3 text-center text-xs text-slate-500">ไม่พบรายการในคิวพัสดุที่โหลดได้</p> : null}
+              <div className="mt-3 grid max-h-80 gap-2 overflow-y-auto lg:grid-cols-2">
+                {trackingRows.map((row: any, index: number) => {
+                  const trackingNo = extractPureTrackingNumber(row.tracking_number) || String(row.tracking_number ?? "").trim();
+                  const displayName = String(row.recipient_name || row.consignee || row.customer_name || "ไม่ระบุชื่อ");
+                  const displayPhone = String(row.matched_phone || row.phone_number || row.order_phone || row.phone || "").trim();
+                  const message = String(row.drakside_tracking_message || row.facebook_tracking_message || "").trim();
+                  const copyKey = `${trackingNo}:${index}`;
+                  const inboxUrl = businessInboxUrl(row);
+                  return <article key={copyKey} className="order-parcel-result rounded-xl border p-3">
+                    <div className="flex flex-wrap items-start justify-between gap-2"><div><p className="font-mono text-sm font-semibold text-cyan-100">{trackingNo || "ไม่มีเลขพัสดุ"}</p><p className="mt-1 text-xs text-slate-200">{displayName}{displayPhone ? ` · ${displayPhone}` : ""}</p></div><span className="text-[10px] text-violet-200/75">{String(row.page_name || "ไม่ระบุเพจ")}</span></div>
+                    <p className="mt-1 text-[10px] text-slate-400">{String(row.order_number_display || row.order_number || "ไม่พบเลขออเดอร์")} · {String(row.pickup_date || row.order_time_display || "ไม่ระบุวันเวลา")} · COD {String(row.cod_amount ?? "—")} บาท</p>
+                    <div className="mt-2 flex flex-wrap gap-2"><span className="rounded-md border border-cyan-300/15 bg-cyan-400/[0.04] px-2 py-1 text-[9px] text-cyan-100/65">ค้นตรง: parcels.tracking_number</span>{row.chat_link_key ? <span className="rounded-md border border-violet-300/15 bg-violet-400/[0.04] px-2 py-1 font-mono text-[9px] text-violet-100/70">{String(row.chat_link_key)}</span> : null}</div>
+                    {inboxUrl ? <a href={inboxUrl} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center rounded-lg border border-cyan-300/25 bg-cyan-400/[0.06] px-3 py-1.5 text-[10px] font-semibold text-cyan-100 transition hover:border-cyan-200/60 hover:bg-cyan-400/15"><ExternalLink className="mr-1.5 h-3.5 w-3.5" />เปิด Inbox จริง</a> : <p className="mt-2 text-[10px] text-amber-200/70">ยังไม่มี Business mapping ของเพจนี้</p>}
+                    {message ? <div className="mt-2 flex items-start gap-2"><pre className="max-h-24 min-w-0 flex-1 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-fuchsia-300/15 bg-black/25 p-2 text-[10px] leading-4 text-fuchsia-50/85">{message}</pre><Button type="button" size="sm" variant="outline" onClick={() => { void navigator.clipboard.writeText(message).then(() => { setTrackingCopied(copyKey); window.setTimeout(() => setTrackingCopied(""), 1400); }); }} className="shrink-0 border-fuchsia-300/25 bg-fuchsia-400/[0.04] px-2 text-[10px] text-fuchsia-100">{trackingCopied === copyKey ? "คัดลอกแล้ว" : "คัดลอก"}</Button></div> : <p className="mt-2 text-[10px] text-slate-500">ไม่มีข้อความแจ้งพัสดุที่บันทึกไว้</p>}
                   </article>;
                 })}
               </div>
-            </div> : null}
-          </div>
-        </div> : null}
+              {matchingChatThreads.length ? <div className="mt-4">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[0.18em] text-violet-100">ผลจาก Chat · {matchingChatThreads.length} ห้อง</h3><span className="text-[9px] text-slate-500">จับคู่ด้วยเบอร์ / chat_link_key / ข้อความ</span></div>
+                <div className="grid gap-2 lg:grid-cols-2">
+                  {matchingChatThreads.map((thread: any) => {
+                    const chatSearch = String(thread.customerName || thread.customerPhone || thread.chatLinkKey || thread.threadId || search);
+                    return <article key={thread.key} className="order-chat-match rounded-xl border p-3">
+                      <div className="flex flex-wrap items-start justify-between gap-2"><div><p className="text-xs font-semibold text-white">{String(thread.customerName || "ไม่ระบุชื่อลูกค้า")}</p><p className="mt-1 font-mono text-[10px] text-cyan-100/80">{String(thread.customerPhone || thread.phone || "ไม่พบเบอร์ในแชท")}</p><p className="mt-1 font-mono text-[10px] text-emerald-200/80">{String(thread.latestOrderNumber || thread.order_number || "ไม่พบเลขออเดอร์")}</p></div><span className="text-[10px] text-violet-200/75">{String(thread.pageName || "ไม่ระบุเพจ")}</span></div>
+                      <p className="mt-2 line-clamp-2 text-[10px] leading-4 text-slate-300">{String(thread.preview || "ไม่มีข้อความตัวอย่าง")}</p>
+                      <div className="mt-2 flex flex-wrap items-center justify-between gap-2"><span className="max-w-full truncate font-mono text-[9px] text-violet-200/70">{thread.chatLinkKey ? `chat_link_key · ${String(thread.chatLinkKey)}` : `thread key · ${String(thread.key)}`}</span><Link href={`/chats?search=${encodeURIComponent(chatSearch)}`} className="inline-flex items-center gap-1 rounded-lg border border-cyan-300/20 bg-cyan-400/[0.04] px-2.5 py-1.5 text-[10px] font-semibold text-cyan-100 hover:bg-cyan-400/[0.1]">เปิดห้องแชท <ExternalLink className="h-3 w-3" /></Link></div>
+                    </article>;
+                  })}
+                </div>
+              </div> : null}
+              {telegramTraceRows.length ? <div className="mt-4">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[0.18em] text-sky-100">ผลจาก Telegram · {telegramTraceRows.length} รายการ</h3><span className="text-[9px] text-slate-500">เทียบคีย์ออเดอร์จาก PIONEER queue / GENESIS history</span></div>
+                <div className="grid gap-2 lg:grid-cols-2">
+                  {telegramTraceRows.map((row: any, index: number) => {
+                    const key = String(row.upsert_key || row.order_number || `${row.order_time_display}:${index}`);
+                    const sent = row._traceRoom === "sent" || telegramRowIsSent(row);
+                    const room = row._traceRoom === "sent" ? "sent" : "queue";
+                    const chatId = telegramChatId(row);
+                    const sentAt = String(row.sent_at || row.telegram_sent_at || "").trim();
+                    return <article key={`${room}:${key}`} className="rounded-xl border border-sky-300/20 bg-sky-400/[0.035] p-3">
+                      <div className="flex flex-wrap items-start justify-between gap-2"><div><p className="text-xs font-semibold text-white">{String(row.order_number_display || row.order_number || "ไม่พบเลขออเดอร์")}</p><p className="mt-1 max-w-full break-all font-mono text-[9px] text-slate-400">upsert_key · {key}</p></div><span className={`rounded-full border px-2 py-1 text-[9px] font-semibold ${sent ? "border-emerald-300/25 bg-emerald-400/[0.08] text-emerald-100" : "border-amber-300/25 bg-amber-400/[0.08] text-amber-100"}`}>{sent ? "SENT · GENESIS" : "QUEUE · PIONEER"}</span></div>
+                      <p className="mt-2 text-[10px] text-slate-300">เพจ {String(row.page_name || "ไม่ระบุ")} · กลุ่ม Telegram {chatId || "ไม่มี chat_id ใน telegram_body"}</p>
+                      <p className="mt-1 text-[9px] text-slate-500">{sentAt ? `เวลาสถานะ SENT · ${sentAt}` : "ยังไม่มี sent_at ในแถวสถานะ"}</p>
+                      <Link href={`/telegram-delivery?search=${encodeURIComponent(key)}&room=${room}`} className="mt-2 inline-flex items-center gap-1 rounded-lg border border-sky-300/20 bg-sky-400/[0.04] px-2.5 py-1.5 text-[10px] font-semibold text-sky-100 hover:bg-sky-400/[0.1]">เปิดรายการ Telegram <ExternalLink className="h-3 w-3" /></Link>
+                    </article>;
+                  })}
+                </div>
+                <p className="mt-2 text-[9px] leading-4 text-slate-500">สถานะ SENT อ่านจาก Supabase GENESIS archive หลัง webhook ตอบกลับ ไม่ได้เปิดอ่านข้อความในกลุ่ม Telegram สดโดยตรง</p>
+              </div> : trackingSearchReady && !telegramQueueQuery.isFetching && !telegramSentQuery.isFetching && !telegramQueueQuery.isError && !telegramSentQuery.isError ? <p className="mt-4 rounded-lg border border-sky-300/10 bg-sky-400/[0.02] p-3 text-center text-[10px] text-slate-500">ไม่พบคีย์นี้ในคิว PIONEER หรือประวัติ GENESIS ของ Telegram</p> : null}
+            </div>
+          </div> : null}
       </section>
+
+        </SheetContent>
+      </Sheet>
 
       <div className="signal-ticker rounded-xl"><span>✦ HERMES ARCHIVE // ORDER SIGNAL // COD VERIFIED // PRODUCT MAP ONLINE // TELEGRAM ROUTE READY // </span></div>
 
@@ -342,6 +440,11 @@ export default function OrderControl() {
         <Metric icon={XCircle} label="ส่งไม่ได้ / ต้องตรวจ" value={blockedOrders.length} suffix="รายการ" tone="rose" />
       </section>
 
+      <section className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border px-4 py-3 ${blockedWarningCount ? "border-rose-300/35 bg-rose-950/25 shadow-[0_0_22px_rgba(251,113,133,.12)]" : warnedOrderCount ? "border-amber-300/30 bg-amber-950/20" : "border-emerald-300/25 bg-emerald-950/15"}`} aria-live="polite">
+        <div><p className={`text-[10px] font-bold uppercase tracking-[.22em] ${blockedWarningCount ? "text-rose-200" : warnedOrderCount ? "text-amber-200" : "text-emerald-200"}`}>ORDER SAFETY RADAR</p><p className="mt-1 text-sm text-slate-100">{warnedOrderCount ? `พบออเดอร์มีจุดเตือน ${warnedOrderCount} รายการ จาก ${orders.length} รายการ` : `ไม่พบจุดเตือนจากข้อมูลที่อ่านได้ · ${orders.length} รายการ`}</p></div>
+        <div className="flex flex-wrap gap-2 text-[10px] font-semibold">{blockedWarningCount > 0 && <span className="rounded-full border border-rose-300/35 bg-rose-400/10 px-3 py-1 text-rose-100">งดส่ง {blockedWarningCount} จุด</span>}{reviewWarningCount > 0 && <span className="rounded-full border border-amber-300/30 bg-amber-400/10 px-3 py-1 text-amber-100">ตรวจเพิ่ม {reviewWarningCount} จุด</span>}<span className="rounded-full border border-white/10 px-3 py-1 text-slate-300">คำนวณจากข้อมูลที่หน้าอ่านได้ · ไม่เขียนกลับฐาน</span></div>
+      </section>
+
       {query.error ? <Card className="border-pink-400/30 bg-pink-950/20 shadow-[0_0_24px_rgba(255,70,190,0.1)]"><CardContent className="p-5 text-sm text-pink-200">อ่านข้อมูลไม่สำเร็จ: {query.error instanceof Error ? query.error.message : String(query.error)}</CardContent></Card> : null}
 
       {/* ⫘ WORKBENCH · ซ้ายรายการออเดอร์ / ขวารายละเอียดออเดอร์ */}
@@ -353,14 +456,15 @@ export default function OrderControl() {
             {query.isLoading ? <p className="p-8 text-center text-sm text-slate-500">กำลังอ่านข้อมูลจาก Supabase…</p> : null}
             {!query.isLoading && !query.error && orders.length === 0 ? <p className="p-8 text-center text-sm text-slate-500">ไม่พบข้อมูล</p> : null}
             {/* การ์ด 1 ใบ · คอลัมน์ที่ใช้: order_number, customer_name, phone, page_name, order_time_display, final_display_for_packer, delivery_status, sent_at */}
-            {orders.map((row, index) => <button key={row.upsert_key} type="button" onClick={() => setSelectedKey(row.upsert_key)} className={`order-list-card ${index === 0 ? "order-list-card-latest" : ""} w-full rounded-2xl border p-3 text-left transition ${selectedOrder?.upsert_key === row.upsert_key ? "order-list-card-selected border-cyan-300/40" : "border-white/5 bg-black/15 hover:border-cyan-300/30 hover:bg-cyan-400/[0.04]"}`}>
+            {orders.map((row, index) => { const rowWarnings = orderWarningsByKey.get(row.upsert_key) ?? []; return <button key={row.upsert_key} type="button" onClick={() => setSelectedKey(row.upsert_key)} className={`order-list-card ${index === 0 ? "order-list-card-latest" : ""} w-full rounded-2xl border p-3 text-left transition ${selectedOrder?.upsert_key === row.upsert_key ? "order-list-card-selected border-cyan-300/40" : "border-white/5 bg-black/15 hover:border-cyan-300/30 hover:bg-cyan-400/[0.04]"}`}>
               <div className="flex items-center justify-between gap-2"><span className="font-mono text-sm font-semibold text-cyan-200">{directText(row.order_number)}</span>{isSent(row) ? <span className="rounded-full border border-orange-300/30 bg-orange-400/10 px-2 py-0.5 text-[10px] font-semibold text-orange-200">🔥SENT</span> : <span className="rounded-full border border-cyan-300/20 px-2 py-0.5 text-[10px] text-cyan-200">รอส่ง</span>}</div>
               <div className="mt-2 text-xs"><span className="font-semibold text-white">{directText(row.customer_name)}</span><span className="ml-3 font-mono text-emerald-200/85">{directText(row.phone)}</span></div>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-violet-200/70"><span>🍊 {directText(row.page_name)} · {directText(row.order_number)}</span><span>{row.order_time_display}</span></div>
               <div className="mt-1 text-sm font-semibold text-amber-100">{money(row.cod_amount)}</div>
               <div className="mt-1 line-clamp-2 text-[11px] leading-4 text-slate-200/85">{directText(row.final_address_for_bill || row.address_display_packer || row.full_address || row.addressclean)}</div>
               <div className="order-card-copy-preview mt-1 line-clamp-1 whitespace-pre-line text-[11px] leading-4 text-emerald-100/80">📦 {directText(row.final_display_for_packer || row.telegram_product_display || row.final_product || row.sku)}</div>
-            </button>)}
+              {rowWarnings.length > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{rowWarnings.slice(0, 2).map((warning) => <span key={warning.code} title={warning.message} className={`max-w-full truncate rounded-full border px-2 py-0.5 text-[9px] ${warning.severity === "BLOCK" ? "border-rose-300/35 bg-rose-500/10 text-rose-100" : "border-amber-300/25 bg-amber-500/[.08] text-amber-100"}`}>{warning.severity === "BLOCK" ? "งดส่ง · " : "ตรวจ · "}{warning.message}</span>)}{rowWarnings.length > 2 && <span className="rounded-full border border-white/10 px-2 py-0.5 text-[9px] text-slate-300">+{rowWarnings.length - 2}</span>}</div>}
+            </button>; })}
           </CardContent>
         </Card>
 
@@ -373,6 +477,10 @@ export default function OrderControl() {
                 <div><p className="font-mono text-base font-semibold text-emerald-200">{directText(selectedOrder.order_number)}</p><p className="mt-1 text-xs text-slate-400">{directText(selectedOrder.customer_name)} · {directText(selectedOrder.phone)} · 📢 {directText(selectedOrder.page_name)}</p></div>
                 <div className="flex items-center gap-2">{isSent(selectedOrder) && <span className="rounded-full border border-orange-300/30 bg-orange-400/10 px-3 py-1 text-xs font-semibold text-orange-200">🔥SENT</span>}<span className="inline-flex items-center gap-2 rounded-lg border border-cyan-400/30 bg-cyan-400/5 px-2 py-1 text-[11px] text-cyan-100"><Clock3 className="h-3.5 w-3.5" />{selectedOrder.order_time_display}</span></div>
               </div>
+              <section className={`rounded-2xl border p-3 sm:p-4 ${selectedOrderWarnings.some((warning) => warning.severity === "BLOCK") ? "border-rose-300/45 bg-rose-950/20" : selectedOrderWarnings.length ? "border-amber-300/35 bg-amber-950/15" : "border-emerald-300/25 bg-emerald-950/10"}`} aria-live="polite">
+                <div className="flex flex-wrap items-center justify-between gap-2"><h3 className={`text-xs font-bold uppercase tracking-[.18em] ${selectedOrderWarnings.some((warning) => warning.severity === "BLOCK") ? "text-rose-100" : selectedOrderWarnings.length ? "text-amber-100" : "text-emerald-100"}`}>{selectedOrderWarnings.length ? "คำเตือนก่อนจัด/ส่ง" : "ตรวจเบื้องต้น · ไม่พบคำเตือน"}</h3><span className="text-[9px] text-slate-400">{selectedOrderWarnings.filter((warning) => warning.severity === "BLOCK").length} งดส่ง · {selectedOrderWarnings.filter((warning) => warning.severity === "REVIEW").length} ตรวจเพิ่ม</span></div>
+                {selectedOrderWarnings.length > 0 ? <ul className="mt-2 space-y-1.5">{selectedOrderWarnings.map((warning) => <li key={warning.code} className={`flex items-start gap-2 text-xs leading-5 ${warning.severity === "BLOCK" ? "text-rose-100" : "text-amber-100"}`}><span className="shrink-0 rounded border px-1.5 py-0.5 text-[9px] font-bold">{warning.severity === "BLOCK" ? "งดส่ง" : "ตรวจ"}</span><span>{warning.message}</span></li>)}</ul> : <p className="mt-2 text-xs text-emerald-100/75">คำเตือนมาจาก n8n; หน้านี้แสดงผลอย่างเดียว ไม่แก้สถานะ</p>}
+              </section>
               {/* SUMMARY + SOURCE · สรุปตรวจเร็วแยกจากก้อนออเดอร์แท้ */}
               <div className="grid min-w-0 gap-3 2xl:grid-cols-[minmax(0,0.82fr)_minmax(0,1.18fr)]">
                 <section className="order-summary-well min-w-0 rounded-2xl border border-cyan-300/20 bg-cyan-400/[0.025] p-3 sm:p-4">
@@ -383,9 +491,9 @@ export default function OrderControl() {
                     <Info label="ที่อยู่จากข้อมูลกลาง" value={selectedOrder.final_address_for_bill} />
                   </div>
                 </section>
-                <section className="order-original-well min-w-0 rounded-2xl border border-violet-300/30 bg-violet-500/[0.035] p-3 sm:p-4 shadow-[inset_0_0_24px_rgba(151,75,255,0.045)]">
-                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-violet-100">02 / ก้อนออเดอร์แท้</h3><span className="rounded-full border border-violet-300/20 bg-violet-400/[0.07] px-2 py-0.5 text-[9px] font-mono text-violet-200">SOURCE · selectedOrder.original</span></div>
-                  <pre className="data-pair-panel max-h-[26rem] min-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-violet-300/20 bg-[#080611]/75 p-3 text-xs leading-5 text-violet-50/90 sm:p-4">{directText(selectedOrder.original) || "ไม่พบก้อนออเดอร์ต้นทางในรายการนี้"}</pre>
+                <section className="order-original-well min-w-0 rounded-2xl border border-pink-300/35 bg-pink-500/[0.04] p-3 sm:p-4 shadow-[inset_0_0_28px_rgba(255,54,206,0.10)]">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2"><h3 className="text-[10px] font-bold uppercase tracking-[0.2em] text-pink-50">02 / ก้อนออเดอร์แท้</h3><span className="rounded-full border border-pink-300/30 bg-pink-400/[0.08] px-2 py-0.5 text-[9px] font-mono text-pink-100">SOURCE · selectedOrder.original</span></div>
+                  <pre className="data-pair-panel max-h-[26rem] min-h-40 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-pink-300/30 bg-[#080611]/75 p-3 text-xs leading-5 text-pink-50 sm:p-4">{directText(selectedOrder.original) || "ไม่พบก้อนออเดอร์ต้นทางในรายการนี้"}</pre>
                   <p className="mt-2 text-[9px] leading-4 text-slate-500">ข้อมูลดิบจากแถวออเดอร์ · แยกจากสรุปเพื่อเทียบต้นทาง · อ่านอย่างเดียว</p>
                 </section>
               </div>
@@ -402,7 +510,7 @@ export default function OrderControl() {
               <div className="flex flex-wrap gap-2">
                 <Button type="button" variant="outline" onClick={() => void copySelectedOrder()} className="border-emerald-300/30 bg-emerald-400/5 text-emerald-100 hover:bg-emerald-400/15">{copied ? <Check className="mr-2 h-4 w-4" /> : <Download className="mr-2 h-4 w-4" />} {copied ? "คัดลอกแล้ว" : "คัดลอกข้อมูลออเดอร์"}</Button>
                 <Link href={`/order-history?search=${encodeURIComponent(selectedOrder.upsert_key)}`}><Button variant="outline" className="border-cyan-300/25 bg-cyan-400/5 text-cyan-100"><ExternalLink className="mr-2 h-4 w-4" />ประวัติ</Button></Link>
-                <Link href={`/telegram-delivery?search=${encodeURIComponent(selectedOrder.upsert_key)}&room=queue`}><Button variant="outline" className="border-fuchsia-300/25 bg-fuchsia-400/5 text-fuchsia-100"><Send className="mr-2 h-4 w-4" />ส่งไป Telegram</Button></Link>
+                <Link href={`/telegram-delivery?search=${encodeURIComponent(selectedOrder.upsert_key)}&room=${isSent(selectedOrder) ? "sent" : "queue"}`}><Button variant="outline" className="border-fuchsia-300/25 bg-fuchsia-400/5 text-fuchsia-100"><Send className="mr-2 h-4 w-4" />เปิดสถานะ Telegram</Button></Link>
                 <Link href={`/chats?search=${encodeURIComponent(selectedOrder.customer_name ?? selectedOrder.order_number ?? "")}`}><Button variant="outline" className="border-emerald-300/25 bg-emerald-400/5 text-emerald-100"><MessageCircle className="mr-2 h-4 w-4" />ไปห้องแชท</Button></Link>
                 <Button type="button" variant="outline" onClick={() => setEditOpen(true)} className="border-pink-300/25 bg-pink-400/5 text-pink-100"><Pencil className="mr-2 h-4 w-4" />EDIT TARGET · แก้ไขออเดอร์</Button>
               </div>

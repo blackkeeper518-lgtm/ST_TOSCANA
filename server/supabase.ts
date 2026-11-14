@@ -8,8 +8,21 @@ export type StockProduct = LiveProductMapping & { id: number; thName: string | n
 export type StockWarning = { kind: "duplicate_sku" | "missing_sku"; sku: string | null; label: string | null; count?: number };
 
 type SupabaseProject = "main" | "tracking" | "chat" | "parcel";
-function config(project: SupabaseProject = "main") {
+export type ChatSupabaseCredentials = { url: string; serviceRoleKey: string };
+
+function config(project: SupabaseProject = "main", browserChatCredentials?: ChatSupabaseCredentials) {
   const lane = project === "chat" ? "chat" : project === "parcel" ? "parcel" : project;
+  if (lane === "chat" && browserChatCredentials) {
+    const url = browserChatCredentials.url.trim().replace(/\/$/, "");
+    const key = browserChatCredentials.serviceRoleKey.trim();
+    if (!url || !key) throw new Error("กรอก Chat Supabase URL และ service-role key ให้ครบใน ROOM 02");
+    let parsed: URL;
+    try { parsed = new URL(url); } catch { throw new Error("Chat Supabase URL ไม่ถูกต้อง"); }
+    if (parsed.protocol !== "https:" || !/^[a-z0-9-]+\.supabase\.co$/i.test(parsed.hostname) || parsed.pathname !== "/" || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) {
+      throw new Error("Chat URL ต้องเป็น https://<project>.supabase.co เท่านั้น");
+    }
+    return { baseUrl: parsed.toString().replace(/\/$/, ""), key };
+  }
   const laneUrl = lane === "chat"
     ? process.env.CHAT_SUPABASE_URL
     : lane === "parcel"
@@ -24,18 +37,24 @@ function config(project: SupabaseProject = "main") {
       : lane === "tracking"
         ? process.env.TRACKING_SUPABASE_SERVICE_ROLE_KEY
         : process.env.ORDER_SUPABASE_SERVICE_ROLE_KEY;
-  // New lanes are additive. Until their Render variables exist, keep the
-  // existing Tracking connection working without a data or route migration.
-  const rawUrl = laneUrl?.trim() || (lane === "chat" || lane === "parcel" ? process.env.TRACKING_SUPABASE_URL?.trim() : undefined) || process.env.SUPABASE_URL?.trim();
-  const key = laneKey?.trim() || (lane === "chat" || lane === "parcel" ? process.env.TRACKING_SUPABASE_SERVICE_ROLE_KEY?.trim() : undefined) || process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+  // Chat credentials belong to a separate Supabase account; never borrow another lane's URL or key.
+  const rawUrl = lane === "chat"
+    ? laneUrl?.trim()
+    : laneUrl?.trim() || (lane === "parcel" ? process.env.TRACKING_SUPABASE_URL?.trim() : undefined) || process.env.SUPABASE_URL?.trim();
+  const key = lane === "chat"
+    ? laneKey?.trim()
+    : laneKey?.trim() || (lane === "parcel" ? process.env.TRACKING_SUPABASE_SERVICE_ROLE_KEY?.trim() : undefined) || process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
   if (!rawUrl || !key) throw new Error(`Supabase ${project} secrets are not configured`);
   let parsed: URL;
   try { parsed = new URL(rawUrl); } catch { throw new Error("SUPABASE_URL is not a valid URL"); }
   if (parsed.protocol !== "https:" || !parsed.hostname.endsWith(".supabase.co")) throw new Error(`Invalid Supabase hostname: ${parsed.hostname}`);
   return { baseUrl: parsed.toString().replace(/\/$/, ""), key };
 }
-export async function supabaseGet<T>(path: string, project: SupabaseProject = "main"): Promise<T> {
-  const { baseUrl, key } = config(project);
+export function getChatSupabaseConfig(credentials?: ChatSupabaseCredentials) {
+  return config("chat", credentials);
+}
+export async function supabaseGet<T>(path: string, project: SupabaseProject = "main", browserChatCredentials?: ChatSupabaseCredentials): Promise<T> {
+  const { baseUrl, key } = config(project, browserChatCredentials);
   const target = `${baseUrl}/rest/v1/${path.replace(/^\/+/, "")}`;
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
@@ -51,7 +70,70 @@ export async function supabaseGet<T>(path: string, project: SupabaseProject = "m
   }
   throw new Error(`Supabase connection failed after 3 attempts (${path}): ${lastError instanceof Error ? lastError.message : String(lastError)}. Target=${target}`);
 }
-export async function supabasePost<T>(path: string, body: unknown, project: SupabaseProject = "main"): Promise<T> { const { baseUrl, key } = config(project); const response = await fetch(`${baseUrl}/rest/v1/${path}`, { method: "POST", headers: { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify(body) }); if (!response.ok) throw new Error(`Supabase returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`); return response.json() as Promise<T>; }
+// สัญญาอ่าน ChatHub: อ่านสองฝั่งต้นทางโดยตรง แล้วให้ canonical layer รวมเป็นห้องเดียว
+const CHAT_READ_WINDOW_MS = 2 * 24 * 60 * 60 * 1000;
+type ChatReadFilter = { pageId?: string; threadId?: string };
+export const CHAT_CUSTOMER_TABLE = "Cust_Chat⭐BINARY_xXx_STAR";
+export const CHAT_PAGE_TABLE = "Pg_Chat⭐BINARY_xXx_STAR";
+export const CHAT_MATRIX_VIEW = "🌠BINARY_xXx_MATRIX";
+export const CHAT_PAGE_TOKEN_TABLE = "🌈MILKY_WAY_xXx_TOKEN _PAGE";
+function chatReadPath(table: string, filter: ChatReadFilter = {}, history = false) {
+  const query = new URLSearchParams();
+  query.set("select", "*");
+  // รายการห้องใช้ recent window เพื่อลดภาระ แต่ห้องที่เปิดอยู่ต้องเห็นประวัติทั้ง thread
+  if (!history) query.set("occurred_at", `gte.${new Date(Date.now() - CHAT_READ_WINDOW_MS).toISOString()}`);
+  query.set("order", "occurred_at.desc");
+  query.set("limit", "10000");
+  if (filter.pageId) query.set("page_id", `eq.${filter.pageId}`);
+  if (filter.threadId) query.set("thread_id", `eq.${filter.threadId}`);
+  return `${encodeURIComponent(table)}?${query.toString()}`;
+}
+async function fetchChatRows(filter: ChatReadFilter = {}, credentials?: ChatSupabaseCredentials, history = false) {
+  const [customerRows, pageRows] = await Promise.all([
+    supabaseGet<Array<Record<string, unknown>>>(chatReadPath(CHAT_CUSTOMER_TABLE, filter, history), "chat", credentials),
+    supabaseGet<Array<Record<string, unknown>>>(chatReadPath(CHAT_PAGE_TABLE, filter, history), "chat", credentials),
+  ]);
+  return [
+    ...customerRows.map(row => ({ ...row, _source_table: CHAT_CUSTOMER_TABLE })),
+    ...pageRows.map(row => ({ ...row, _source_table: CHAT_PAGE_TABLE })),
+  ];
+}
+export async function fetchChatThreadRows(credentials?: ChatSupabaseCredentials) {
+  return fetchChatRows({}, credentials);
+}
+export async function fetchChatMessageRows(input: { pageId: string; threadId: string }, credentials?: ChatSupabaseCredentials) {
+  return fetchChatRows({ pageId: input.pageId, threadId: input.threadId }, credentials, true);
+}
+const CHAT_CONNECTION_CHECKS = [
+  { name: CHAT_CUSTOMER_TABLE, columns: "id,page_id,thread_id,message_text,phone" },
+  { name: CHAT_PAGE_TABLE, columns: "id,page_id,thread_id,message_text" },
+  { name: CHAT_MATRIX_VIEW, columns: "id,page_id,thread_id,speaker,message_text" },
+  { name: "🌓VAGABOND_xXx_DISMISS", columns: "id" },
+  { name: "🏴‍☠️SIRIUS_xXx_CRASH", columns: "case_id" },
+  { name: CHAT_PAGE_TOKEN_TABLE, columns: "page_id,access_token" },
+] as const;
+export async function checkChatConnection(credentials?: ChatSupabaseCredentials) {
+  await Promise.all(CHAT_CONNECTION_CHECKS.map(({ name, columns }) => {
+    const query = new URLSearchParams({ select: columns, limit: "0" });
+    return supabaseGet<Array<Record<string, unknown>>>(`${encodeURIComponent(name)}?${query.toString()}`, "chat", credentials);
+  }));
+  // ส่งกลับเฉพาะชื่อ object; ห้ามส่ง page token หรือข้อมูลแชทออกจาก server
+  return { checked: CHAT_CONNECTION_CHECKS.map(({ name }) => name) };
+}
+export async function supabasePost<T>(path: string, body: unknown, project: SupabaseProject = "main", prefer?: string, browserChatCredentials?: ChatSupabaseCredentials): Promise<T> { const { baseUrl, key } = config(project, browserChatCredentials); const headers: Record<string, string> = { apikey: key, Authorization: `Bearer ${key}`, "Content-Type": "application/json" }; if (prefer) headers.Prefer = prefer; const response = await fetch(`${baseUrl}/rest/v1/${path}`, { method: "POST", headers, body: JSON.stringify(body) }); if (!response.ok) throw new Error(`Supabase returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`); return response.json() as Promise<T>; }
+export async function recordOutgoingChatMessage(input: { portalKey?: string; chatLinkKey?: string; pageId: string; pageName?: string; threadId: string; recipientId: string; messageId?: string; text?: string; occurredAt?: Date }, credentials?: ChatSupabaseCredentials) {
+  const occurredAt = input.occurredAt ?? new Date();
+  const iso = occurredAt.toISOString();
+  const messageId = input.messageId?.trim() || null;
+  const chatLinkKey = input.chatLinkKey?.trim() || `${input.pageId}_t_${input.threadId}`;
+  const payload = { chat_link_key: chatLinkKey, page_id: input.pageId, page_name: input.pageName?.trim() || null, portal_key: input.portalKey?.trim() || null, thread_id: input.threadId, recipient_id: input.recipientId, message_id: messageId, speaker: "page", is_sent: true, time: iso, occurred_at: iso, message_time_display: iso, message_text: input.text?.trim() || null, page_latest_message: input.text?.trim() || null, page_message_time_th: iso, sync_status: "SENT", dedupe_key: messageId ? `${chatLinkKey}:${messageId}` : `${chatLinkKey}:${iso}` };
+  const pageMessagePayload = { chat_link_key: chatLinkKey, page_id: input.pageId, page_name: input.pageName?.trim() || null, portal_key: input.portalKey?.trim() || null, thread_id: input.threadId, recipient_id: input.recipientId, sender_id: input.pageId, sender_name: input.pageName?.trim() || null, speaker_type: "page", speaker: "page", side: "right", is_sent: true, message_id: messageId, message_text: input.text?.trim() || null, time: iso, occurred_at: iso, dedupe_key: messageId ? `${chatLinkKey}:${messageId}` : `${chatLinkKey}:${iso}` };
+  // เพิ่มแถวใหม่ต่อทุกข้อความตอบกลับ; ไม่ใช้ upsert หรือบังคับ unique key
+  try { await supabasePost<Record<string, unknown>[]>(encodeURIComponent(CHAT_PAGE_TABLE), pageMessagePayload, "chat", "return=representation", credentials); }
+  catch (error) { console.error("[chat] canonical page-message write failed", error); }
+  const relation = encodeURIComponent("🧿BB_xXx_ORDERCONTROL");
+  return supabasePost<Record<string, unknown>[]>(relation, payload, "chat", "return=representation", credentials);
+}
 export async function fetchParcelMappingQueue(input: { status: "all" | "sent"; limit: number }) {
   // These are quoted PostgreSQL relation names; keep the space after the emoji.
   // n8n owns the pipeline mutations. This room only reads the queue and history.

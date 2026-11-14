@@ -14,41 +14,39 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const CONFIG_KEY = "bb-supabase-config";
 const TRACKING_CONFIG_KEY = "bb-tracking-supabase-config";
-const CHAT_CONFIG_KEY = "bb-chat-supabase-config";
 const PARCEL_CONFIG_KEY = "bb-parcel-supabase-config";
+const VAULT_CONFIG_KEY = "bb-vault-supabase-config";
 export type Camp = "BB";
-export type SupabaseProject = "main" | "tracking" | "chat" | "parcel";
+export type SupabaseProject = "main" | "tracking" | "parcel" | "vault";
 const DEPLOYMENT_CAMP: Camp = "BB";
 export type SupabaseConfig = { url: string; anonKey: string; orderTable?: string };
-// Browser connections use public Anon/Publishable keys only; never store service-role keys here.
+// Browser client ใช้เฉพาะ Anon/Publishable key; Chat ต้องผ่าน protected server route เท่านั้น
 const DEPLOYMENT_SUPABASE_URL = String(import.meta.env.VITE_SUPABASE_URL ?? "").trim().replace(/\/$/, "");
 const DEPLOYMENT_SUPABASE_ANON_KEY = String(import.meta.env.VITE_SUPABASE_ANON_KEY ?? "").trim();
 const DEPLOYMENT_TRACKING_URL = String(import.meta.env.VITE_TRACKING_SUPABASE_URL ?? "").trim().replace(/\/$/, "");
 const DEPLOYMENT_TRACKING_ANON_KEY = String(import.meta.env.VITE_TRACKING_SUPABASE_ANON_KEY ?? "").trim();
-const DEPLOYMENT_CHAT_URL = String(import.meta.env.VITE_CHAT_SUPABASE_URL ?? "").trim().replace(/\/$/, "");
-const DEPLOYMENT_CHAT_ANON_KEY = String(import.meta.env.VITE_CHAT_SUPABASE_ANON_KEY ?? "").trim();
 const DEPLOYMENT_PARCEL_URL = String(import.meta.env.VITE_PARCEL_SUPABASE_URL ?? "").trim().replace(/\/$/, "");
 const DEPLOYMENT_PARCEL_ANON_KEY = String(import.meta.env.VITE_PARCEL_SUPABASE_ANON_KEY ?? "").trim();
+const DEPLOYMENT_VAULT_URL = String(import.meta.env.VITE_VAULT_SUPABASE_URL ?? "").trim().replace(/\/$/, "");
+const DEPLOYMENT_VAULT_ANON_KEY = String(import.meta.env.VITE_VAULT_SUPABASE_ANON_KEY ?? "").trim();
 const clients: Partial<Record<SupabaseProject, SupabaseClient>> = {};
 const clientSignatures: Partial<Record<SupabaseProject, string>> = {};
 export function getActiveCamp(): Camp { return DEPLOYMENT_CAMP; }
-export function setActiveCamp(_camp: Camp) { for (const project of ["main", "tracking", "chat", "parcel"] as const) { delete clients[project]; delete clientSignatures[project]; } }
+export function setActiveCamp(_camp: Camp) { for (const project of ["main", "tracking", "parcel", "vault"] as const) { delete clients[project]; delete clientSignatures[project]; } }
 function profileKey(_camp: Camp, project: SupabaseProject) {
   if (project === "tracking") return TRACKING_CONFIG_KEY;
-  if (project === "chat") return CHAT_CONFIG_KEY;
   if (project === "parcel") return PARCEL_CONFIG_KEY;
+  if (project === "vault") return VAULT_CONFIG_KEY;
   return CONFIG_KEY;
 }
-export function getSupabaseConfig(camp: Camp = getActiveCamp(), project: SupabaseProject = "main", urlOverride?: string): SupabaseConfig | null {
+export function getSupabaseConfig(camp: Camp = getActiveCamp(), project: SupabaseProject = "main"): SupabaseConfig | null {
   try {
-    const pinnedUrl = String(urlOverride ?? "").trim().replace(/\/$/, "");
     const raw = localStorage.getItem(profileKey(camp, project));
     if (raw) {
       const value = JSON.parse(raw) as Partial<SupabaseConfig>;
-      const url = pinnedUrl || String(value.url ?? "").trim().replace(/\/$/, "");
-      if (url && value.anonKey) return { url, anonKey: value.anonKey, orderTable: project === "main" ? defaultOrderView(camp) : undefined };
+      if (value.url && value.anonKey) return { url: value.url.replace(/\/$/, ""), anonKey: value.anonKey, orderTable: project === "main" ? defaultOrderView(camp) : undefined };
     }
-    if (project === "chat" || project === "parcel") {
+    if (project === "parcel") {
       const fallback = localStorage.getItem(TRACKING_CONFIG_KEY);
       if (fallback) {
         const value = JSON.parse(fallback) as Partial<SupabaseConfig>;
@@ -56,8 +54,8 @@ export function getSupabaseConfig(camp: Camp = getActiveCamp(), project: Supabas
       }
     }
   } catch { /* invalid local value; try deployment defaults */ }
-  const url = String(urlOverride ?? "").trim().replace(/\/$/, "") || (project === "tracking" ? DEPLOYMENT_TRACKING_URL : project === "chat" ? DEPLOYMENT_CHAT_URL || DEPLOYMENT_TRACKING_URL : project === "parcel" ? DEPLOYMENT_PARCEL_URL || DEPLOYMENT_TRACKING_URL : DEPLOYMENT_SUPABASE_URL);
-  const anonKey = project === "tracking" ? DEPLOYMENT_TRACKING_ANON_KEY : project === "chat" ? DEPLOYMENT_CHAT_ANON_KEY || DEPLOYMENT_TRACKING_ANON_KEY : project === "parcel" ? DEPLOYMENT_PARCEL_ANON_KEY || DEPLOYMENT_TRACKING_ANON_KEY : DEPLOYMENT_SUPABASE_ANON_KEY;
+  const url = project === "tracking" ? DEPLOYMENT_TRACKING_URL : project === "parcel" ? DEPLOYMENT_PARCEL_URL || DEPLOYMENT_TRACKING_URL : project === "vault" ? DEPLOYMENT_VAULT_URL : DEPLOYMENT_SUPABASE_URL;
+  const anonKey = project === "tracking" ? DEPLOYMENT_TRACKING_ANON_KEY : project === "parcel" ? DEPLOYMENT_PARCEL_ANON_KEY || DEPLOYMENT_TRACKING_ANON_KEY : project === "vault" ? DEPLOYMENT_VAULT_ANON_KEY : DEPLOYMENT_SUPABASE_ANON_KEY;
   return url && anonKey ? { url, anonKey, orderTable: project === "main" ? defaultOrderView(camp) : undefined } : null;
 }
 export function saveSupabaseConfig(config: SupabaseConfig, camp: Camp = getActiveCamp(), project: SupabaseProject = "main") {
@@ -68,8 +66,8 @@ export function saveSupabaseConfig(config: SupabaseConfig, camp: Camp = getActiv
 export function clearSupabaseConfig(camp: Camp = getActiveCamp(), project: SupabaseProject = "main") {
   localStorage.removeItem(profileKey(camp, project)); delete clients[project]; delete clientSignatures[project];
 }
-export function getSupabase(project: SupabaseProject = "main", urlOverride?: string) {
-  const config = getSupabaseConfig(getActiveCamp(), project, urlOverride);
+export function getSupabase(project: SupabaseProject = "main") {
+  const config = getSupabaseConfig(getActiveCamp(), project);
   if (!config) return null;
   const signature = `${getActiveCamp()}|${config.url}|${config.anonKey}`;
   if (!clients[project] || signature !== clientSignatures[project]) {
@@ -78,18 +76,6 @@ export function getSupabase(project: SupabaseProject = "main", urlOverride?: str
   }
   return clients[project] ?? null;
 }
-export function subscribeToChatMessages(onChange: () => void) {
-  const api = getSupabase("chat");
-  if (!api) return () => undefined;
-  const channel = api
-    .channel(`chat-live-${getActiveCamp().toLowerCase()}`)
-    .on("postgres_changes", { event: "*", schema: "public", table: "chat_customer_messages" }, onChange)
-    .on("postgres_changes", { event: "*", schema: "public", table: "chat_page_messages" }, onChange)
-    .subscribe();
-  return () => { void api.removeChannel(channel); };
-}
-const CHAT_HISTORY_DAYS = 2;
-function chatHistoryCutoff() { return new Date(Date.now() - CHAT_HISTORY_DAYS * 24 * 60 * 60 * 1000).toISOString(); }
 export const supabase = { from: (table: string) => { const api = getSupabase(); if (!api) throw new Error("ยังไม่ได้เชื่อม Supabase: ไปที่ /connect แล้วกรอก URL และ Anon Key"); return api.from(table); } } as any;
 function fail(error: any): never { throw new Error(error?.message || "Supabase connection failed"); }
 function num(v: any) { const n = Number(v); return v == null || v === "" || !Number.isFinite(n) ? null : n; }
@@ -107,16 +93,9 @@ function chatAttachmentPayload(row: any) {
     }
     if (typeof value === "object") values.push(value);
   };
-  add(row?.attachments_json);
-  add(row?.attachments);
   add(row?.attachments_raw);
   add(row?.attachment_urls);
   add(row?.attachment_url);
-  add(row?.image_urls);
-  add(row?.image_url);
-  add(row?.media_url);
-  add(row?.file_url);
-  add(row?.message_attachments);
   add(row?.sticker_url);
   return JSON.stringify(values);
 }
@@ -152,6 +131,28 @@ export function orderTimeSortKey(value: unknown): number {
     return Number(`${part("year")}${part("month")}${part("day")}${part("hour")}${part("minute")}`);
   }
   return displayOrderSortKey(raw);
+}
+
+function chatDateMs(value: unknown): number | null {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  const display = raw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (display) {
+    let year = Number(display[3]);
+    if (year < 100) year += 1957;
+    else if (year > 2400) year -= 543;
+    const localAsUtc = Date.UTC(year, Number(display[2]) - 1, Number(display[1]), Number(display[4] ?? 0), Number(display[5] ?? 0), Number(display[6] ?? 0));
+    return localAsUtc - 7 * 60 * 60 * 1000;
+  }
+  const parsed = new Date(raw).getTime();
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isBangkokToday(value: unknown, now = new Date()) {
+  const timestamp = chatDateMs(value);
+  if (timestamp == null) return false;
+  const format = (date: Date) => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Bangkok", year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+  return format(new Date(timestamp)) === format(now);
 }
 function displayDateKey(value: unknown): string {
   const match = String(value ?? "").trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
@@ -309,16 +310,13 @@ const HERMES_WEB_ORDER_COLUMNS = [
 
 // HERMES_ARCHIVE stores the three aliased view fields with their original names.
 const HERMES_DIRECT_ORDER_COLUMNS = HERMES_WEB_ORDER_COLUMNS
-  .replace("currentThreadTotalBills", "currentthreadtotalbills")
-  .replace("balloonNotice", "balloonnotice")
-  .replace("sniperAuthorClass", "sniperauthorclass");
+  .replace(/order_time_display/g, "order_time_display");
 
 // Only fields used by TelegramDeliveryRoom; avoid returning all 330 view columns.
 const TELEGRAM_WEB_ORDER_COLUMNS = [
   // PIONEER and ANDROMEDA share the operational order number, but ANDROMEDA
   // does not expose the optional order_number_display column.
   "upsert_key", "source_table", "order_time_display", "order_number",
-  "balloonnotice",
   "telegram_product_display", "final_display_for_packer", "order_fibo_product", "for_packer_st_display", "manus_for_packer", "google_for_packer", "packer_tag_display", "packer_obj",
   "address_fibo_selected_clean", "address_display_packer", "full_address", "province", "zipcode", "phone", "extracted_phone",
   "cod_amount", "customer_name", "facebook_name", "page_name", "shipping_carrier", "sku",
@@ -379,7 +377,7 @@ export async function readTelegramDeliveryOrders(search = "", room: "queue" | "t
 export async function readBbAlertRoom(search = "") {
   const api = getSupabase();
   if (!api) fail({ message: "ยังไม่ได้เชื่อม Supabase: ไปที่ /connect แล้วกรอก URL และ Anon Key" });
-  const { data, error } = await api.from("🔸 PARADOX_xXx_EXCHANGE").select("*").order("order_time_display", { ascending: false }).limit(2000);
+  const { data, error } = await api.from("🔸PARADOX_xXx_EXCHANGE").select("*").order("order_time_display", { ascending: false }).limit(2000);
   if (error) fail(error);
   const query = search.trim().toLowerCase();
   return (data ?? [])
@@ -502,7 +500,7 @@ const GENESIS_HISTORY_COLUMNS = [
   "address_display_packer", "addressclean", "province", "zipcode", "sku",
   "order_fibo_product", "for_packer_st_display", "manus_for_packer",
   "google_for_packer", "packer_tag_display", "packer_obj", "telegram_product_display",
-  "telegram_message", "balloonnotice", "original",
+  "telegram_message", "original",
   "cod_amount", "expected_cod", "shipping_carrier", "source_table", "telegram_status",
   "telegram_sent", "sent_at", "telegram_sent_at"
 ].join(",");
@@ -534,6 +532,29 @@ export async function readGenesisOrderHistory(date: string) {
   const orders = (data ?? []).sort((a: any, b: any) => displayOrderSortKey(b.order_time_display) - displayOrderSortKey(a.order_time_display));
 
   return { orders, total: orders.length, sourceView: "🌟GENESIS_xXx_HISTORY", fetchedAt: new Date().toISOString() };
+}
+
+export async function readDailyTrackingHistory(date: string) {
+  const api = getSupabase("parcel");
+  if (!api) fail({ message: "ยังไม่ได้เชื่อม Tracking & Messenger: ไปที่ /secret-gallery แล้วบันทึก URL กับ Anon/Publishable Key" });
+  const { data, error } = await api.from("📓DEAD_xXx_NOTE").select("*").limit(2000);
+  if (error) fail(error);
+  const dayKey = (value: unknown) => {
+    const raw = String(value ?? "").trim();
+    if (!raw) return "";
+    const parsed = new Date(raw);
+    return Number.isNaN(parsed.getTime())
+      ? raw.slice(0, 10)
+      : new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Bangkok" }).format(parsed);
+  };
+  const orders = (data ?? []).filter((row: any) => [
+    row.facebook_tracking_sent_at,
+    row.sent_at,
+    row.pickup_date,
+    row.order_time,
+    row.order_time_display,
+  ].some(value => dayKey(value) === date));
+  return { orders, total: orders.length, sourceView: "📓DEAD_xXx_NOTE", fetchedAt: new Date().toISOString() };
 }
 export async function readTelegramSentHistory(search = "") {
   const api = getSupabase();
@@ -605,99 +626,258 @@ export async function readDailyParcels(date: string, search = "") {
   });
   return { parcels, total: parcels.length, sourceTable: "parcels", fetchedAt: new Date().toISOString() };
 }
-async function readChatRows() {
-  const api = getSupabase("chat");
-  if (!api) fail({ message: "ยังไม่ได้เชื่อม Tracking & Messenger: ไปที่ /secret-gallery แล้วกรอก URL และ Anon Key" });
-  // Read the newest window first. Ascending + limit would permanently return
-  // the oldest rows once a chat table grows beyond the limit.
-  const cutoff = chatHistoryCutoff();
-  const [customerResult, pageResult] = await Promise.all([
-    api.from("chat_customer_messages").select("*").gte("occurred_at", cutoff).order("occurred_at", { ascending: false }).limit(10000),
-    api.from("chat_page_messages").select("*").gte("occurred_at", cutoff).order("occurred_at", { ascending: false }).limit(10000),
-  ]);
-  if (customerResult.error) fail(customerResult.error);
-  const customers = customerResult.data ?? [];
-  const pages = pageResult.error ? [] : (pageResult.data ?? []);
-  const rows = [
-    ...customers.map((r: any) => ({ ...r, _speaker: r.speaker_type || r.speaker || "customer", _side: r.side || "left", _name: r.customer_name || r.sender_name, _text: asText(r.message_text ?? r.message_raw), _thread: r.thread_id || r.conversation_key || r.conversation_id, _occurred: r.occurred_at || r.time || r.created_at, _hasAttachment: hasChatAttachment(r) })),
-    ...pages.map((r: any) => ({ ...r, _speaker: r.speaker_type || r.speaker || "page", _side: r.side || "right", _name: r.page_sender_name || r.sender_name, _text: asText(r.message_text ?? r.message_raw), _thread: r.thread_id || r.conversation_key || r.conversation_id, _occurred: r.occurred_at || r.time || r.created_at, _hasAttachment: hasChatAttachment(r) })),
-  ];
-  return rows.sort((a, b) => new Date(a._occurred || a.occurred_at || a.synced_at || 0).getTime() - new Date(b._occurred || b.occurred_at || b.synced_at || 0).getTime());
-}
-export async function readChatThreads() {
-  const rows = await readChatRows();
-  const map = new Map<string, any>();
-  for (const row of rows) {
-    const pageId = String(row.page_id ?? row.pageId ?? "").trim();
-    const threadId = String(row._thread ?? row.threadId ?? row.conversation_id ?? "").trim();
-    const key = `${pageId}:${threadId}`;
-    const current = map.get(key) ?? {
-      key, pageId, threadId, customerId: row.customer_id || row.recipient_id || row.customerId || row.sender_id, pageName: row.page_name || "ไม่ระบุเพจ",
-      customerName: row.customer_name || row._name || "ลูกค้า", latestAt: row._occurred || row.occurred_at || row.synced_at,
-      preview: row._text || (row._hasAttachment ? "[ไฟล์แนบ]" : ""), unread: false, messageCount: 0, chatTimeline: [],
+function normalizeChatReadRows(sourceRows: any[]) {
+  return sourceRows.filter(row => {
+    // ห้องจริงต้องมี page_id และ thread_id; กันแถว metadata/แถวว่างไม่ให้กลายเป็นห้อง
+    const hasRoomKey = String(row?.page_id ?? "").trim() && String(row?.thread_id ?? row?.threadId ?? "").trim();
+    if (!hasRoomKey) return false;
+    const isPage = row._source_table === "Pg_Chat⭐BINARY_xXx_STAR";
+    // แถว delivery/status อย่างเดียวไม่ใช่ข้อความแชท และห้ามเปิดเป็นห้องเปล่า
+    return Boolean(
+      asText(row?.message_text).trim()
+      || (isPage && asText(row?.facebook_tracking_message).trim())
+      || asText(row?.customer_latest_message).trim()
+      || asText(row?.page_latest_message).trim()
+      || hasChatAttachment(row),
+    );
+  }).flatMap(row => {
+    const isPage = row._source_table === "Pg_Chat⭐BINARY_xXx_STAR";
+    // สองโต๊ะต้นทางเป็น source of truth: Cust = ลูกค้า, Pg = เพจ
+    // เพราะบางรอบ n8n ใส่ speaker ผิดแถวจนข้อความลูกค้าถูกตีเป็นข้อความเพจ
+    const rawSpeaker = asText(row.speaker).trim().toLowerCase();
+    const isCustomer = row._source_table === "Cust_Chat⭐BINARY_xXx_STAR";
+    const speaker = isCustomer ? "customer" : isPage ? "page"
+      : rawSpeaker && /^(page|เพจ|admin|แอดมิน|outbound|เจ้าหน้าที่)$/i.test(rawSpeaker) ? "page" : "customer";
+    const isPageSpeaker = speaker === "page";
+    // customer_latest_message คือข้อความแรก/ล่าสุดจากลูกค้าในแถวสรุปของ n8n
+    // บางแถวไม่มี message_text แต่มีฟิลด์นี้ จึงห้ามปล่อยให้กลายเป็น bubble ว่าง
+    const messageText = asText(row.message_text).trim()
+      || (isPageSpeaker ? asText(row.page_latest_message).trim() : asText(row.customer_latest_message).trim())
+      || asText(row.text).trim()
+      || asText(row.message).trim();
+    const threadId = String(row.thread_id ?? row.threadId ?? "").trim();
+    const base = {
+      ...row,
+      // เชื่อค่า speaker ที่ผู้ใช้กำหนด; ใช้ต้นทางตารางสำรองเมื่อไม่มีค่าเท่านั้น
+      _speaker: speaker,
+      _side: isPageSpeaker ? "right" : "left",
+      // ชื่อป้ายห้องมาจาก Facebook API เท่านั้น; customer_name เป็นชื่อในบิล ห้ามนำมาแทน
+      _name: isPageSpeaker ? row.page_name : row.facebook_name,
+      // message_text เป็นหลัก; ข้อความ tracking ขาออกใช้ facebook_tracking_message เมื่อ message_text ว่าง
+      _text: messageText || (isPageSpeaker ? asText(row.facebook_tracking_message).trim() : ""),
+      _thread: threadId,
+      _occurred: row.occurred_at || row.time,
+      _hasAttachment: hasChatAttachment(row),
     };
-    current.latestAt = row._occurred || row.occurred_at || row.synced_at || current.latestAt;
+    // แถวสรุปจาก n8n อาจมี customer_latest และ page_latest อยู่พร้อมกัน
+    // เพราะ 3 Flow เขียนห่างกันเป็นรอบ ๆ จึงต้องแตกเป็น bubble แยกฝั่งเอง
+    if (!asText(row.message_text).trim() && (asText(row.customer_latest_message).trim() || asText(row.page_latest_message).trim())) {
+      const splitRows = [];
+      const customerText = asText(row.customer_latest_message).trim();
+      const pageText = asText(row.page_latest_message).trim();
+      if (customerText) splitRows.push({ ...base, _speaker: "customer", _side: "left", _name: row.facebook_name, _text: customerText, _occurred: row.customer_message_time_th || row.occurred_at || row.time, time_th: row.customer_message_time_th || row.time_th });
+      if (pageText) splitRows.push({ ...base, _speaker: "page", _side: "right", _name: row.page_name, _text: pageText, _occurred: row.page_message_time_th || row.occurred_at || row.time, time_th: row.page_message_time_th || row.time_th });
+      return splitRows;
+    }
+    return [base];
+  }).sort((a, b) => (chatDateMs(a._occurred) ?? 0) - (chatDateMs(b._occurred) ?? 0));
+}
+function chatCustomerNameCandidate(row: any) {
+  const value = String(row.facebook_name ?? "").trim();
+  return value ? { value, priority: 1 } : null;
+}
+export function mapChatRowsToThreads(sourceRows: any[]) {
+  const rows = normalizeChatReadRows(sourceRows);
+  const map = new Map<string, any>();
+  const customerThreadKeys = new Set(
+    rows
+      .filter(row => row._speaker === "customer" && (row._text || row._hasAttachment))
+      .map(row => `${String(row.page_id ?? "").trim()}:${String(row._thread ?? "").trim()}`),
+  );
+  for (const row of rows) {
+    const pageId = String(row.page_id ?? "").trim();
+    const threadId = String(row._thread ?? "").trim();
+    const key = `${pageId}:${threadId}`;
+    const nameCandidate = chatCustomerNameCandidate(row);
+    const current = map.get(key) ?? {
+      key, pageId, threadId, portalKey: row.portal_key || null, chatLinkKey: row.chat_link_key || null,
+      timeSlotLabel: String(row.time_slot_label ?? "").trim() || null,
+      customerId: row.customer_id || row.recipient_id || null, customerPhone: row.phone || null, pageName: row.page_name || "ไม่ระบุเพจ",
+      customerName: nameCandidate?.value || "", _customerNamePriority: nameCandidate?.priority ?? -1,
+      latestAt: row._occurred || row.occurred_at || null,
+      preview: row._text || (row._hasAttachment ? "[ไฟล์แนบ]" : ""), unread: false, messageCount: 0, chatTimeline: [],
+      customerLatestMessage: row.customer_latest_message || null, customerMessageTimeTh: row.customer_message_time_th || null,
+      pageLatestMessage: row.page_latest_message || null, pageMessageTimeTh: row.page_message_time_th || null,
+      pagerMessageTimeTh: row.pager_message_time_th || null,
+      upsert_key: row.upsert_key || null, order_number: row.order_number || null,
+      _searchTokens: "",
+      is_sent: row.is_sent === true || row.is_sent === "true",
+      order_number_display: row.order_number_display || null, order_time: row.order_time || null,
+      order_time_display: row.order_time_display || null, cod_amount: row.cod_amount ?? null,
+      facebook_name: row.facebook_name || null, manus_for_packer: row.manus_for_packer || null,
+      parcel_status_emoji: row.parcel_status_emoji || null,
+      delivery_status: row.delivery_status || null,
+      orderTodayActive: false,
+      trackingAgeMs: null,
+    };
+    current.latestAt = row._occurred || row.occurred_at || current.latestAt;
     current.preview = row._text || (row._hasAttachment ? "[ไฟล์แนบ]" : current.preview);
-    current.customerId ||= row.customer_id || row.recipient_id || row.customerId || row.sender_id;
-    current.customerName = current.customerName === "ลูกค้า" ? row.customer_name || row._name || current.customerName : current.customerName;
+    if (String(row.time_slot_label ?? "").trim()) current.timeSlotLabel = String(row.time_slot_label).trim();
+    current.customerId ||= row.customer_id || row.recipient_id || null;
+    current.customerPhone ||= row.phone || null;
+    current.portalKey ||= row.portal_key || null;
+    current.chatLinkKey ||= row.chat_link_key || null;
+    if (nameCandidate && nameCandidate.priority >= current._customerNamePriority) {
+      current.customerName = nameCandidate.value;
+      current._customerNamePriority = nameCandidate.priority;
+    }
+    current.is_sent ||= row.is_sent === true || row.is_sent === "true";
+    for (const [source, target] of [
+      ["customer_latest_message", "customerLatestMessage"], ["customer_message_time_th", "customerMessageTimeTh"],
+      ["page_latest_message", "pageLatestMessage"], ["page_message_time_th", "pageMessageTimeTh"],
+      ["pager_message_time_th", "pagerMessageTimeTh"], ["upsert_key", "upsert_key"], ["order_number", "order_number"],
+      ["order_number_display", "order_number_display"], ["order_time", "order_time"], ["order_time_display", "order_time_display"],
+      ["cod_amount", "cod_amount"], ["facebook_name", "facebook_name"], ["manus_for_packer", "manus_for_packer"],
+      ["parcel_status_emoji", "parcel_status_emoji"], ["phone", "phone"],
+    ]) {
+      const value = row[source];
+      if (value != null && String(value).trim()) current[target] = value;
+    }
     current.messageCount += 1;
     current.chatTimeline.push(`${row._speaker === "page" ? "[เพจ]" : "[ลูกค้า]"} ${row._text || (row._hasAttachment ? "[ไฟล์แนบ]" : "")}`);
     // Tracking fields are supplied directly on either room-side table; keep the newest non-empty value.
-    for (const field of ["tracking_number", "order_number", "order_number_display", "shipping_carrier", "facebook_tracking_message", "drakside_tracking_message"]) {
+    for (const field of ["tracking_number", "order_number", "order_number_display", "shipping_carrier", "facebook_tracking_message", "drakside_tracking_message", "source_lane", "delivery_status", "tracking_created_at", "tracking_number_created_at", "tracking_time", "tracking_at", "tracking_sent_at", "facebook_tracking_sent_at", "sent_at", "pickup_date"]) {
       if (row[field] != null && String(row[field]).trim()) current[field] = row[field];
+    }
+    current._searchTokens = [current._searchTokens, row.phone, row.customer_id, row.recipient_id, row.order_number, row.order_number_display, row.upsert_key, row.chat_link_key].filter(Boolean).join(" ");
+
+    const hasOrderNumber = Boolean(String(current.order_number_display ?? current.order_number ?? "").trim());
+    const orderTime = current.order_time_display ?? current.order_time ?? row.order_time_display ?? row.order_time ?? row.occurred_at;
+    current.orderTodayActive = current.orderTodayActive || (hasOrderNumber && isBangkokToday(orderTime));
+    if (current.tracking_number) {
+      const trackingTime = [
+        current.tracking_created_at, current.tracking_number_created_at, current.tracking_time,
+        current.tracking_at, current.tracking_sent_at, current.facebook_tracking_sent_at,
+        current.sent_at, current.pickup_date, current.order_time_display, current.order_time,
+        current.latestAt,
+      ].find(value => String(value ?? "").trim());
+      const timestamp = chatDateMs(trackingTime);
+      if (timestamp != null) current.trackingAgeMs = Date.now() - timestamp;
     }
 
     map.set(key, current);
   }
-  return Array.from(map.values()).sort((a, b) => new Date(b.latestAt || 0).getTime() - new Date(a.latestAt || 0).getTime());
+  return Array.from(map.values()).filter(thread => customerThreadKeys.has(thread.key)).map(({ _customerNamePriority, _searchTokens, ...thread }) => ({
+    ...thread,
+    customerPhone: thread.phone || thread.customerPhone || null,
+    latestOrderNumber: thread.order_number_display || thread.order_number || "",
+    searchText: [thread.customerName, thread.customerPhone, thread.customerId, thread.chatLinkKey, thread.upsert_key, thread.order_number, thread.order_number_display, _searchTokens, thread.preview].filter(Boolean).join(" "),
+  })).sort((a, b) => new Date(b.latestAt || 0).getTime() - new Date(a.latestAt || 0).getTime());
 }
-export async function readChatMessages(pageId: string, threadId: string) { const rows = await readChatRows(); return rows.filter(row => String(row.page_id) === String(pageId) && String(row._thread) === String(threadId)).map((row: any) => ({ id: row.id, text: row._text || (row._hasAttachment ? "ส่งรูปภาพ" : ""), message_text: row._text, direction: row._speaker === "page" ? "outbound" : "inbound", senderType: row._speaker, senderName: row._name, side: row._side, occurredAt: row._occurred || row.occurred_at || row.synced_at, attachmentsJson: chatAttachmentPayload(row), imageUrls: row.image_urls || [] })); }
+export function mapChatRowsToMessages(sourceRows: any[]) {
+  return normalizeChatReadRows(sourceRows).map((row: any) => ({
+    // บางโต๊ะแชทไม่มี id ของแถว; ห้ามปล่อย undefined ซ้ำทุก bubble
+    id: row.id ?? row.message_id ?? row.dedupe_key ?? `${row._thread}:${row._occurred}:${row._speaker}:${row._text}`,
+    text: row._text,
+    message_text: asText(row.message_text),
+    direction: row._speaker === "page" ? "outbound" : "inbound",
+    senderType: row._speaker,
+    senderName: row._name,
+    side: row._side,
+    occurredAt: row._occurred,
+    messageId: row.message_id,
+    dedupeKey: row.dedupe_key,
+    isSent: row.is_sent,
+    messageTimeDisplay: row.message_time_display,
+    timeTh: row.time_th,
+    customerLatestMessage: row.customer_latest_message,
+    customerMessageTimeTh: row.customer_message_time_th,
+    pageLatestMessage: row.page_latest_message,
+    pageMessageTimeTh: row.page_message_time_th,
+    attachmentsJson: chatAttachmentPayload(row),
+    imageUrls: Array.isArray(row.attachment_urls) ? row.attachment_urls : row.attachment_url ? [row.attachment_url] : [],
+  }));
+}
+export function reconcileOptimisticMessages(optimistic: any[], persisted: any[]) {
+  const persistedIds = new Set(persisted
+    .filter(message => message.direction === "outbound")
+    .map(message => String(message.messageId ?? "").trim())
+    .filter(Boolean));
+  if (!persistedIds.size) return optimistic;
+  const remaining = optimistic.filter(message => {
+    const messageId = String(message.messageId ?? "").trim();
+    return !messageId || !persistedIds.has(messageId);
+  });
+  return remaining.length === optimistic.length ? optimistic : remaining;
+}
 export type CloseJobCase = { id: string; page_id: string; page_name: string; conversation_key: string; customer_id: string; customer_name: string; speaker_type: string; occurred_at: string; message_text: string; case_type: string; area: string; branch: string; carrier_employee: string; tracking_number: string; order_number: string };
 export async function readCloseJobCases(limit = 10000): Promise<CloseJobCase[]> {
-  const api = getSupabase("tracking");
-  if (!api) fail({ message: "ยังไม่ได้เชื่อม Tracking & Messenger: ไปที่ /secret-gallery แล้วบันทึก URL กับ Anon/Publishable Key" });
-  const [casesResult, notesResult] = await Promise.all([
-    api.from("vw_bb_close_job_cases").select("*").order("occurred_at", { ascending: false }).limit(Math.max(1, Math.min(limit, 10000))),
-    api.from("bb_delivery_case_notes").select("case_id,branch,carrier_employee,area"),
-  ]);
-  if (casesResult.error) fail(casesResult.error);
-  if (notesResult.error) fail(notesResult.error);
-  const notes = new Map((notesResult.data ?? []).map((note: any) => [String(note.case_id), note]));
-  return (casesResult.data ?? []).map((row: any) => {
-    const note = notes.get(String(row.id));
-    return {
-      ...row,
-      branch: note ? String(note.branch ?? "") : String(row.branch ?? ""),
-      carrier_employee: note ? String(note.carrier_employee ?? "") : String(row.carrier_employee ?? ""),
-      area: note ? String(note.area ?? "") : String(row.area ?? ""),
-    } as CloseJobCase;
-  });
+  const api = getSupabase();
+  if (!api) return [];
+  const { data, error } = await api.from("Cust_Chat⭐BINARY_xXx_STAR")
+    .select("id,page_id,page_name,conversation_id,thread_id,customer_id,customer_name,message_id,speaker,is_sent,time,created_at,occurred_at,message_text,tracking_number,order_number,order_number_display,order_time_display,phone,facebook_name,shipping_carrier")
+    .order("occurred_at", { ascending: false })
+    .limit(Math.max(1, Math.min(limit, 10000)));
+  if (error) fail(error);
+  const classify = (value: unknown) => {
+    const message = String(value ?? "").replace(/\s+/gu, "");
+    if (message.includes("ปิดงาน")) return "ปิดงาน";
+    if (message.includes("ยกเลิก") || message.includes("ไม่เอาแล้ว")) return "ยกเลิก / ไม่เอาแล้ว";
+    if (/สั่ง.{0,16}แล้วไม่รับ/u.test(message)) return "สั่งแล้วไม่รับ";
+    return "";
+  };
+  return (data ?? []).filter((row: any) => {
+    const speaker = String(row.speaker ?? "").toLowerCase();
+    return speaker !== "page" && speaker !== "admin" && speaker !== "business" && classify(row.message_text);
+  }).map((row: any) => ({
+    id: String(row.id ?? row.message_id ?? row.order_number ?? ""),
+    page_id: String(row.page_id ?? ""),
+    page_name: String(row.page_name ?? ""),
+    conversation_key: String(row.conversation_id ?? row.thread_id ?? ""),
+    customer_id: String(row.customer_id ?? ""),
+    customer_name: String(row.customer_name ?? row.facebook_name ?? ""),
+    speaker_type: "customer",
+    occurred_at: String(row.occurred_at ?? row.time ?? row.created_at ?? ""),
+    message_text: String(row.message_text ?? ""),
+    case_type: classify(row.message_text),
+    area: "",
+    branch: "",
+    carrier_employee: "",
+    tracking_number: String(row.tracking_number ?? ""),
+    order_number: String(row.order_number_display ?? row.order_number ?? ""),
+  }));
 }
 export async function saveCloseJobCaseFields(input: { caseId: string; branch: string; carrierEmployee: string; area: string }) {
-  const api = getSupabase("tracking");
-  if (!api) fail({ message: "ยังไม่ได้เชื่อม Tracking & Messenger: ไปที่ /secret-gallery แล้วบันทึก URL กับ Anon/Publishable Key" });
-  const { error } = await api.from("bb_delivery_case_notes").upsert({
-    case_id: input.caseId,
-    branch: input.branch.trim(),
-    carrier_employee: input.carrierEmployee.trim(),
-    area: input.area.trim(),
-    updated_at: new Date().toISOString(),
-  }, { onConflict: "case_id" });
-  if (error) fail(error);
-  return { ok: true };
+  void input;
+  return { ok: false, readOnly: true };
 }
 export async function readParcelMappingQueue(status: "all" | "sent" = "all", limit = 300) {
   const api = getSupabase("parcel");
   if (!api) fail({ message: "ยังไม่ได้เชื่อม Tracking & Messenger: ไปที่ /secret-gallery แล้วบันทึก URL กับ Anon/Publishable Key" });
-  const safeLimit = Math.max(1, Math.min(limit, 500));
+  const safeLimit = Math.max(1, Math.min(limit, 5000));
   const activeData = status === "sent" ? { data: [], error: null } : (await api.from("🦅ROGUE_xXx_SHIPPINGz").select("*").limit(safeLimit));
   if ("error" in activeData && activeData.error) fail(activeData.error);
   const sent = status === "all" || status === "sent" ? await api.from("📓DEAD_xXx_NOTE").select("*").limit(safeLimit) : { data: [], error: null };
   if (sent.error) fail(sent.error);
-  const rows = [...("data" in activeData ? (activeData.data ?? []) : []), ...(sent.data ?? [])];
+  // DEAD is the authoritative sent history. If the same parcel briefly exists
+  // in both views while the source status is propagating, keep DEAD first so
+  // the web never hides a sent row behind the waiting-queue copy.
+  const rows = [
+    ...(sent.data ?? []).map((row: any) => ({ ...row, parcel_queue_source: "DEAD" })),
+    ...( "data" in activeData ? (activeData.data ?? []) : [] ).map((row: any) => ({ ...row, parcel_queue_source: "ROGUE" })),
+  ];
   const seen = new Set<string>();
-  return rows.filter((row: any) => {
-    const key = String(row.tracking_number ?? row.order_number ?? row.id ?? "").trim();
+  return rows.map((row: any) => {
+    const messageId = String(row.message_id ?? "").trim();
+    const recipientId = String(row.recipient_id ?? "").trim();
+    return {
+      ...row,
+      chat_key: messageId && recipientId ? `${messageId}:${recipientId}` : null,
+      chat_key_valid: Boolean(messageId && recipientId),
+    };
+  }).filter((row: any) => {
+    // ห้องแชทใช้คีย์คู่เท่านั้น; fallback นี้มีไว้แค่กันแถว parcel ที่ไม่มีข้อมูลแชทหายจากหน้าคิว
+    const key = row.chat_key || `parcel:${String(row.id ?? row.tracking_number ?? row.order_number ?? "")}`;
     if (!key || seen.has(key)) return false;
     seen.add(key);
     return true;
